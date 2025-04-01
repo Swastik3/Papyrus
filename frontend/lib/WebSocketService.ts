@@ -1,3 +1,5 @@
+/* lib/WebSocketService.tsx */
+
 import { io, Socket } from 'socket.io-client';
 
 interface UploadStatus {
@@ -18,8 +20,6 @@ export class WebSocketService {
   private reconnectInterval = 2000; // 2 seconds
   private isConnecting = false;
   private isReconnecting = false;
-  private tokenBuffer: string[] = []; // Buffer for token batching
-  private tokenTimerId: NodeJS.Timeout | null = null;
 
   constructor(private url: string = 'http://localhost:5001') {
     this.connect();
@@ -105,18 +105,17 @@ export class WebSocketService {
         this.emit('upload_progress', data);
       });
 
-      // Add listeners for streaming tokens with batching for smoother animation
+      // Simplified token handler - directly emit each token with debug logging
       this.socket.on('token', (data) => {
+        console.log('Token Received: ', data);
         if (data && data.token) {
-          // Add token to buffer
-          this.tokenBuffer.push(data.token);
+          // Log before passing to listeners
+            console.log('Emitting Token to Listeners', data.token);
+          // this.emit('token', data);
           
-          // If timer is not running, start it
-          if (!this.tokenTimerId) {
-            this.tokenTimerId = setTimeout(() => {
-              this.flushTokenBuffer();
-            }, 16); // ~60fps refresh rate (16ms)
-          }
+          // Log after emission
+            console.log('Token Emitted', 
+            'Listeners count:', this.listeners['token'] ? this.listeners['token'].length : 0);
         }
       });
 
@@ -129,17 +128,18 @@ export class WebSocketService {
       // Add listeners for query results
       this.socket.on('query_result', (data) => {
         console.log('Query result:', data);
-        // Flush any remaining tokens
-        this.flushTokenBuffer();
         this.emit('query_result', data);
       });
 
       // Add listeners for query errors
       this.socket.on('query_error', (data) => {
         console.error('Query error:', data);
-        // Flush any remaining tokens
-        this.flushTokenBuffer();
         this.emit('query_error', data);
+      });
+
+      // Debug all events
+      this.socket.onAny((event, ...args) => {
+        console.log('Socket event received:', event, args);
       });
 
       this.socket.on('error', (data) => {
@@ -149,22 +149,6 @@ export class WebSocketService {
     } catch (error) {
       console.error('Error initializing socket:', error);
       this.isConnecting = false;
-    }
-  }
-
-  // Flush token buffer to emit tokens with better performance
-  private flushTokenBuffer() {
-    if (this.tokenBuffer.length > 0) {
-      const combinedToken = this.tokenBuffer.join('');
-      console.log(`Flushing ${this.tokenBuffer.length} tokens: "${combinedToken.substring(0, 20)}${combinedToken.length > 20 ? '...' : ''}"`);
-      this.emit('token', { token: combinedToken });
-      this.tokenBuffer = [];
-    }
-    
-    // Clear the timer
-    if (this.tokenTimerId) {
-      clearTimeout(this.tokenTimerId);
-      this.tokenTimerId = null;
     }
   }
 
@@ -211,12 +195,6 @@ export class WebSocketService {
   }
 
   public disconnect() {
-    // Clear any pending token flush
-    if (this.tokenTimerId) {
-      clearTimeout(this.tokenTimerId);
-      this.tokenTimerId = null;
-    }
-    
     if (this.socket) {
       this.socket.disconnect();
       this.socket = null;

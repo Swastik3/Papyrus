@@ -11,6 +11,8 @@ import logging
 from werkzeug.utils import secure_filename
 import json
 from dotenv import load_dotenv
+# from gevent import monkey
+# monkey.patch_all()
 load_dotenv()
 
 # Import RAG utilities
@@ -366,6 +368,7 @@ def handle_query(data):
         
         # Define a function to emit tokens during streaming
         def emit_token(event, data):
+            print(f"Emitting token: {data}")
             socketio.emit(event, data, room=request.sid)
         
         # Generate answer with streaming
@@ -373,7 +376,7 @@ def handle_query(data):
             query, 
             model=model, 
             conversation_id=conversation_id,
-            streaming=True,
+            # streaming=True,
             socket_emit_func=emit_token
         )
         

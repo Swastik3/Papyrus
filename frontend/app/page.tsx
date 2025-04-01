@@ -16,7 +16,9 @@ export default function Home() {
   const [messages, setMessages] = useState<Message[]>([]);
   const [pdfs, setPdfs] = useState<File[]>([]);
   const [isLoading, setIsLoading] = useState<boolean>(false);
-  const [streamingContent, setStreamingContent] = useState<string | null>(null);
+  // Initialize as empty string instead of null
+  const [streamingContent, setStreamingContent] = useState<string>("");
+  const [isStreaming, setIsStreaming] = useState<boolean>(false);
   const [conversationId, setConversationId] = useState<string>(
     `conv-${Date.now()}-${Math.random().toString(36).substring(2, 9)}`
   );
@@ -30,12 +32,12 @@ export default function Home() {
     scrollToBottom();
   }, [messages]);
 
-  // Add new effect to handle scrolling during streaming
+  // Separate effect for streaming content updates
   useEffect(() => {
-    if (streamingContent !== null) {
+    if (isStreaming) {
       scrollToBottom();
     }
-  }, [streamingContent]);
+  }, [isStreaming, streamingContent]);
 
   const handleSubmit = async (message: string, uploadedPdfIds?: string[]) => {
     if (!message.trim()) return;
@@ -43,47 +45,55 @@ export default function Home() {
     // Add user message to chat
     setMessages(prev => [...prev, { role: 'user', content: message }]);
     
-    // Reset streaming content and set loading state
+    // Reset streaming state
     setStreamingContent("");
+    setIsStreaming(true);
     setIsLoading(true);
+    
+    console.log("Message submitted, waiting for streaming response...");
   };
 
   const handleStreamToken = (token: string) => {
-    console.log("Stream token received:", token);
+    console.log('%c handleStreamToken called ', 'background: #27ae60; color: white; padding: 4px;', token);
     
-    // Ensure we always update state with the new token
+    // Ensure we're in streaming mode
+    if (!isStreaming) {
+      console.log('%c Setting isStreaming to true ', 'background: #f1c40f; color: white; padding: 4px;');
+      setIsStreaming(true);
+    }
+    
+    // Update streaming content with more visibility
     setStreamingContent(prev => {
-      const current = prev === null ? "" : prev;
-      return current + token;
+      const newContent = prev + token;
+      console.log('%c streamingContent updated ', 'background: #e67e22; color: white; padding: 4px;', 
+        'Length:', newContent.length, 
+        'Content (last 20 chars):', newContent.slice(-20));
+      return newContent;
     });
-    
-    // Ensure we're scrolling to bottom with each token
-    setTimeout(scrollToBottom, 10);
   };
 
   const handleQueryResponse = (answer: string, sources: string[]) => {
-    // When we get the final response
-    if (streamingContent !== null) {
-      // Use the streamed content for the message
-      setMessages(prev => [...prev, { 
-        role: 'assistant', 
-        content: streamingContent,
-        sources: sources 
-      }]);
-    } else {
-      // Fallback for HTTP response
-      setMessages(prev => [...prev, { 
-        role: 'assistant', 
-        content: answer,
-        sources: sources 
-      }]);
-    }
+    console.log("Query complete, final answer length:", answer.length);
+    console.log("Current streaming content length:", streamingContent.length);
+    console.log("isStreaming:", isStreaming);
     
-    // Clear streaming content and loading state
-    setStreamingContent(null);
+    // IMPORTANT: Save the current streaming content to a local variable 
+    // to avoid race conditions with state updates
+    const finalContent = isStreaming ? streamingContent : answer;
+    
+    // Add the final message
+    setMessages(prev => [...prev, { 
+      role: 'assistant', 
+      content: finalContent.length > 0 ? finalContent : answer, // Fallback to answer
+      sources: sources 
+    }]);
+    
+    // Reset streaming states
+    setIsStreaming(false);
+    setStreamingContent("");
     setIsLoading(false);
     
-    // Ensure we scroll to the bottom after adding the new message
+    // Ensure we scroll to bottom
     setTimeout(scrollToBottom, 50);
   };
 
@@ -104,6 +114,15 @@ export default function Home() {
     setIsSidebarExpanded(expanded);
   };
 
+  // Debug logging for any changes to our key state variables
+  useEffect(() => {
+    console.log("isStreaming changed:", isStreaming);
+  }, [isStreaming]);
+
+  useEffect(() => {
+    console.log("isLoading changed:", isLoading);
+  }, [isLoading]);
+
   return (
     <div className="flex min-h-screen bg-[#0A0A0A] text-gray-100">
       {/* Sidebar component */}
@@ -118,11 +137,17 @@ export default function Home() {
           <h1 className="text-3xl font-bold text-center mb-8 text-white">Papyrus</h1>
           <div className="border-b border-gray-600 mb-8"></div>
           
+          {/* Debug display to see state values */}
+          {/* <div className="mb-2 text-xs text-gray-500">
+            Debug: isStreaming={String(isStreaming)}, isLoading={String(isLoading)}, 
+            streamingContent length={streamingContent.length}
+          </div> */}
+          
           {/* Chat messages component */}
           <ChatMessages 
             messages={messages} 
             isLoading={isLoading}
-            streamingContent={streamingContent}
+            streamingContent={isStreaming ? streamingContent : null}
             messagesEndRef={messagesEndRef} 
           />
           

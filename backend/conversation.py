@@ -482,13 +482,13 @@ def generate_answer_with_context_and_history(
                 if chunk.choices[0].delta.content:
                     content = chunk.choices[0].delta.content
                     answer_chunks.append(content)
-                    
+                    print(content, end='', flush=True)
                     # Emit the token to the client
                     logger.debug(f"Emitting token: {content}")
                     socket_emit_func('token', {'token': content})
                     
                     # Small delay to avoid overwhelming the client
-                    time.sleep(0.01)
+                    time.sleep(0.2)
             
             # Combine chunks into final answer
             answer = ''.join(answer_chunks)

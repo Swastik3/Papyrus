@@ -17,20 +17,19 @@ const ChatMessages: React.FC<ChatMessagesProps> = ({
   // Reference for the streaming message
   const streamingRef = useRef<HTMLDivElement>(null);
   
+  // For debugging
+  console.log("ChatMessages rendering, streamingContent length:", streamingContent ? streamingContent.length : 0);
+  
   // Auto-scroll when streaming content changes
   useEffect(() => {
-    if (streamingContent !== null && streamingContent !== "") {
-      // Use requestAnimationFrame to ensure smooth scrolling during streaming
-      requestAnimationFrame(() => {
-        if (streamingRef.current) {
-          streamingRef.current.scrollIntoView({ behavior: "smooth" });
-        }
-      });
+    if (streamingContent !== null && streamingRef.current) {
+      streamingRef.current.scrollIntoView({ behavior: "smooth" });
     }
   }, [streamingContent]);
 
   return (
     <div className="flex-1 overflow-y-auto mb-4 space-y-4">
+      {/* Regular messages */}
       {messages.map((message, index) => (
         <div
           key={index}
@@ -59,13 +58,15 @@ const ChatMessages: React.FC<ChatMessagesProps> = ({
         </div>
       ))}
       
-      {/* Streaming content with improved animation */}
+      {/* Streaming content - more visible for debugging */}
       {streamingContent !== null && (
-        <div className="flex justify-start animate-fadeIn">
-          <div className="bg-[#1A1A1A] rounded-lg py-3 px-5 max-w-[70%]">
+        <div className="flex justify-start">
+          <div 
+            className="bg-[#2d385b] rounded-lg py-3 px-5 max-w-[70%] relative" 
+            style={{ borderLeft: '3px solid #4a7dff' }}
+          >
             <p className="text-gray-200 whitespace-pre-line">{streamingContent}</p>
-            {/* Improved blinking cursor with better animation */}
-            <span className="inline-block ml-1 w-2 h-4 bg-blue-400 animate-cursor-blink"></span>
+            <span className="inline-block absolute ml-1 w-2 h-5 bg-blue-400 bottom-3 animate-pulse"></span>
             <div ref={streamingRef}></div>
           </div>
         </div>

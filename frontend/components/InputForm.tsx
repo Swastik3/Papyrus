@@ -22,7 +22,7 @@ interface InputFormProps {
   onPdfUpload: (files: File[]) => void;
   onRemovePdf: (index: number) => void;
   onQueryResponse: (answer: string, sources: string[]) => void;
-  onStreamToken: (token: string) => void; // New prop for streaming tokens
+  onStreamToken: (token: string) => void;
   conversationId?: string;
 }
 
@@ -42,7 +42,6 @@ const InputForm: React.FC<InputFormProps> = ({
   const [uploadedPdfIds, setUploadedPdfIds] = useState<string[]>([]);
   const [isConnected, setIsConnected] = useState<boolean>(false);
   const [isMessageLoading, setIsMessageLoading] = useState<boolean>(false);
-  const [currentUploadId, setCurrentUploadId] = useState<string | null>(null);
   const [currentQueryId, setCurrentQueryId] = useState<string | null>(null);
   const inputRef = useRef<HTMLInputElement>(null);
 
@@ -102,19 +101,21 @@ const InputForm: React.FC<InputFormProps> = ({
       }
     });
 
-    // Handle streaming token events
+    // Handle streaming token events with clear debug logging
     const unsubscribeToken = socketService.on('token', (data) => {
-      console.log('Token received in InputForm:', data);
+      console.log('%c InputForm received token ', 'background: #e74c3c; color: white; padding: 4px;', data);
       if (data && data.token) {
-        // Call the onStreamToken callback with the token
+        console.log('%c Calling onStreamToken ', 'background: #9b59b6; color: white; padding: 4px;', data.token);
         onStreamToken(data.token);
+        
+        // Log after callback
+        console.log('%c onStreamToken called ', 'background: #34495e; color: white; padding: 4px;');
       }
     });
 
     // Handle query processing status
     const unsubscribeQueryProcessing = socketService.on('query_processing', (data) => {
       console.log('Query processing:', data);
-      // Set loading state if not already set
       if (!isMessageLoading) {
         setIsMessageLoading(true);
       }
@@ -123,9 +124,14 @@ const InputForm: React.FC<InputFormProps> = ({
     // Handle query results
     const unsubscribeQueryResult = socketService.on('query_result', (data) => {
       console.log('Query result received:', data);
-      if (data.queryId === currentQueryId) {
-        // Complete the query with the final answer and sources
+      
+      // Check if this is the query we're waiting for
+      if (data.queryId === currentQueryId || currentQueryId === null) {
+        // IMPORTANT: Call onQueryResponse first before changing loading state
+        // This ensures that the complete streamed content is used
         onQueryResponse(data.answer, data.sources || []);
+        
+        // Now we can update loading state
         setIsMessageLoading(false);
         setCurrentQueryId(null);
       }
@@ -163,7 +169,6 @@ const InputForm: React.FC<InputFormProps> = ({
     // Process each file
     for (const file of files) {
       const uploadId = `upload-${Date.now()}-${Math.random().toString(36).substring(2, 9)}`;
-      setCurrentUploadId(uploadId);
       
       // Add to status tracking
       setUploadStatuses(prev => [
@@ -263,8 +268,8 @@ const InputForm: React.FC<InputFormProps> = ({
       
       console.log('Query sent via WebSocket:', success);
       
-      // If the WebSocket send fails, fall back to HTTP
       if (!success) {
+        console.warn('WebSocket send failed, falling back to HTTP');
         fallbackToHttpQuery(message, queryId);
       }
     } else {
@@ -299,6 +304,8 @@ const InputForm: React.FC<InputFormProps> = ({
       
       // Call onQueryResponse with the result
       onQueryResponse(result.answer, result.sources || []);
+      
+      // Reset loading state
       setIsMessageLoading(false);
       setCurrentQueryId(null);
     } catch (error) {
