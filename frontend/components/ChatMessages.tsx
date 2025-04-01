@@ -1,5 +1,5 @@
-import React from 'react';
-import { Message } from '@/app/page';
+import React, { useEffect, useRef } from 'react';
+import { Message } from '../app/page';
 
 interface ChatMessagesProps {
   messages: Message[];
@@ -14,6 +14,21 @@ const ChatMessages: React.FC<ChatMessagesProps> = ({
   streamingContent,
   messagesEndRef 
 }) => {
+  // Reference for the streaming message
+  const streamingRef = useRef<HTMLDivElement>(null);
+  
+  // Auto-scroll when streaming content changes
+  useEffect(() => {
+    if (streamingContent !== null && streamingContent !== "") {
+      // Use requestAnimationFrame to ensure smooth scrolling during streaming
+      requestAnimationFrame(() => {
+        if (streamingRef.current) {
+          streamingRef.current.scrollIntoView({ behavior: "smooth" });
+        }
+      });
+    }
+  }, [streamingContent]);
+
   return (
     <div className="flex-1 overflow-y-auto mb-4 space-y-4">
       {messages.map((message, index) => (
@@ -26,7 +41,7 @@ const ChatMessages: React.FC<ChatMessagesProps> = ({
               message.role === 'user' ? 'bg-[#2A2A2A]' : 'bg-[#1A1A1A]'
             }`}
           >
-            <p className="text-gray-200">{message.content}</p>
+            <p className="text-gray-200 whitespace-pre-line">{message.content}</p>
             {message.sources && message.sources.length > 0 && (
               <div className="mt-2 pt-2 border-t border-gray-700">
                 <p className="text-xs text-gray-400">Sources:</p>
@@ -44,17 +59,20 @@ const ChatMessages: React.FC<ChatMessagesProps> = ({
         </div>
       ))}
       
-      {/* Streaming response */}
-      {streamingContent && (
-        <div className="flex justify-start">
-          <div className="max-w-[70%] bg-[#1A1A1A] rounded-lg py-3 px-5">
+      {/* Streaming content with improved animation */}
+      {streamingContent !== null && (
+        <div className="flex justify-start animate-fadeIn">
+          <div className="bg-[#1A1A1A] rounded-lg py-3 px-5 max-w-[70%]">
             <p className="text-gray-200 whitespace-pre-line">{streamingContent}</p>
+            {/* Improved blinking cursor with better animation */}
+            <span className="inline-block ml-1 w-2 h-4 bg-blue-400 animate-cursor-blink"></span>
+            <div ref={streamingRef}></div>
           </div>
         </div>
       )}
       
-      {/* Loading indicator (only show if not streaming) */}
-      {isLoading && !streamingContent && (
+      {/* Loading indicator (only shown if not streaming) */}
+      {isLoading && streamingContent === null && (
         <div className="flex justify-start">
           <div className="bg-[#1A1A1A] rounded-lg p-4">
             <div className="flex space-x-2">
@@ -65,6 +83,7 @@ const ChatMessages: React.FC<ChatMessagesProps> = ({
           </div>
         </div>
       )}
+      
       <div ref={messagesEndRef} />
     </div>
   );

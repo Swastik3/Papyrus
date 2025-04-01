@@ -1,3 +1,4 @@
+#rag_utils.py
 import os
 import logging
 import numpy as np
@@ -6,9 +7,10 @@ import pinecone
 from pypdf import PdfReader
 import time
 import io
-import fitz  # PyMuPDF
 from openai import OpenAI
 import json
+import fitz  # PyMuPDF
+import requests
 
 # Configure logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
@@ -81,44 +83,24 @@ def create_or_get_index(index_name: str, dimension: int):
         raise
 
 def extract_text_from_pdf_bytes(pdf_bytes: bytes) -> str:
-    """Extract all text from PDF bytes"""
+    """Extract all text from PDF bytes using PyMuPDF"""
     try:
-        pdf_stream = io.BytesIO(pdf_bytes)
-        reader = PdfReader(pdf_stream)
-        text = ""
-        for page in reader.pages:
-            text += page.extract_text() + " "
-        return text
-    except Exception as e:
-        logger.error(f"Error extracting text from PDF: {e}")
-        raise
-
-def extract_text_from_pdf_file(pdf_path: str) -> str:
-    """Extract all text from a PDF file using PyMuPDF"""
-    try:
-        # Open the PDF file directly by path
-        pdf_document = fitz.open(pdf_path)
+        # Create a document object from the bytes
+        pdf_document = fitz.open(stream=pdf_bytes, filetype="pdf")
         
         # Extract text from each page
         text = ""
-        total_pages = len(pdf_document)
-        logger.info(f"Processing PDF with {total_pages} pages")
-        
-        for page_num in range(total_pages):
-            if page_num % 10 == 0:  # Log progress every 10 pages
-                logger.info(f"Extracting text from page {page_num+1}/{total_pages}")
-            
+        for page_num in range(len(pdf_document)):
             page = pdf_document[page_num]
-            page_text = page.get_text()
-            text += page_text + " "
+            text += page.get_text() + " "
             
         # Close the document
         pdf_document.close()
         
-        logger.info(f"Successfully extracted text from PDF file '{pdf_path}': {len(text)} characters")
+        logger.info(f"Successfully extracted text from PDF: {len(text)} characters")
         return text
     except Exception as e:
-        logger.error(f"Error extracting text from PDF file '{pdf_path}' with PyMuPDF: {e}")
+        logger.error(f"Error extracting text from PDF with PyMuPDF: {e}")
         raise
 
 def chunk_text(text: str, chunk_size: int, chunk_overlap: int) -> list:
@@ -184,93 +166,45 @@ def chunk_text(text: str, chunk_size: int, chunk_overlap: int) -> list:
 
 def create_embeddings(chunks: list, model_name: str = 'text-embedding-3-small') -> np.ndarray:
     """Create embeddings for each text chunk using OpenAI's embedding model"""
-    # Initialize OpenAI client with network-focused configuration
-    client = OpenAI(
-        api_key=os.getenv('OPENAI_API_KEY'),
-        timeout=90.0,  # Longer timeout for network issues
-        max_retries=5  # More retries for intermittent issues
-    )
-    
+    # Initialize OpenAI client
+    logger.info(f"The API_KEY is {os.getenv('OPENAI_API_KEY')}")
+    client = OpenAI(api_key=os.getenv('OPENAI_API_KEY'))
+
+    try:
+        test = requests.get('https://api.openai.com/v1/engines', 
+                            timeout=5, 
+                            headers={'Authorization': f'Bearer {os.getenv("OPENAI_API_KEY")}'})
+        logger.info(f"Connectivity test: {test.status_code}")
+    except Exception as conn_err:
+        logger.error(f"Connectivity test failed: {str(conn_err)}")
     # Initialize empty array to store embeddings
     embeddings = []
-    chunk_count = len(chunks)
-    logger.info(f"Creating embeddings for {chunk_count} chunks using model {model_name}")
-    
-    for i in range(0, chunk_count, BATCH_SIZE):
+    logger.info(f"First few chunks for debugging: {chunks[:5]}")
+    for i in range(0, len(chunks), BATCH_SIZE):
         batch = chunks[i:i+BATCH_SIZE]
-        batch_size = len(batch)
-        batch_num = i//BATCH_SIZE + 1
-        total_batches = (chunk_count-1)//BATCH_SIZE + 1
-        
-        logger.info(f"Processing batch {batch_num}/{total_batches} with {batch_size} chunks")
-        
-        # Track timing for diagnostics
-        start_time = time.time()
-        
         try:
-            # Make the API call with exponential backoff retry logic
-            retry = 0
-            max_retries = 5
-            retry_delay = 1
-            success = False
-            
-            while retry < max_retries and not success:
-                try:
-                    response = client.embeddings.create(
-                        input=batch,
-                        model=model_name
-                    )
-                    success = True
-                except Exception as retry_error:
-                    retry += 1
-                    if retry < max_retries:
-                        logger.warning(f"Connection error on attempt {retry}/{max_retries}: {str(retry_error)}")
-                        logger.warning(f"Retrying in {retry_delay} seconds...")
-                        time.sleep(retry_delay)
-                        retry_delay *= 2  # Exponential backoff
-                    else:
-                        # Last attempt failed, re-raise with more context
-                        logger.error(f"All {max_retries} attempts failed")
-                        raise Exception(f"Failed to create embeddings after {max_retries} attempts: {str(retry_error)}")
-            
+            response = client.embeddings.create(
+                input=batch,
+                model=model_name
+            )
+            # logger.error(f"Embeddings reposnse: {response}")
             # Extract embeddings from response
             batch_embeddings = [item.embedding for item in response.data]
             embeddings.extend(batch_embeddings)
             
-            # Log successful batch completion with timing
-            elapsed = time.time() - start_time
-            logger.info(f"Batch {batch_num}/{total_batches} completed in {elapsed:.2f}s ({batch_size/elapsed:.1f} chunks/sec)")
-            
-            # Adaptive rate limiting
-            if i + BATCH_SIZE < chunk_count:
-                # Calculate adaptive delay based on API response time
-                # Faster responses → shorter delay, slower responses → longer delay
-                adaptive_delay = min(max(1.0, elapsed * 0.5), 5.0)
-                logger.info(f"Waiting {adaptive_delay:.2f}s before next batch")
-                time.sleep(adaptive_delay)
+            # Sleep to respect rate limits if not the last batch
+            if i + BATCH_SIZE < len(chunks):
+                time.sleep(0.5)
                 
         except Exception as e:
-            logger.error(f"Error creating embeddings for batch {batch_num}/{total_batches}: {str(e)}")
-            
-            # Try to get a network diagnostic
-            try:
-                import socket
-                can_connect = socket.create_connection(("api.openai.com", 443), timeout=5)
-                logger.info(f"Network connectivity test: {'Success' if can_connect else 'Failed'}")
-                if can_connect:
-                    can_connect.close()
-            except Exception as net_error:
-                logger.error(f"Network diagnostic failed: {str(net_error)}")
-            
+            logger.error(f"Error creating embeddings for batch starting at index {i}: {e}")
             raise
     
     # Convert list of embeddings to numpy array
-    embeddings_array = np.array(embeddings)
-    logger.info(f"Successfully created embeddings array with shape {embeddings_array.shape}")
-    return embeddings_array
+    return np.array(embeddings)
 
 def prepare_pinecone_batch(chunks: list, embeddings: np.ndarray, file_id: str, filename: str, 
-                          page_numbers: list = None, conversation_id: str = None) -> list:
+                        conversation_id:str, page_numbers: list = None) -> list:
     """
     Prepare data in the format required for Pinecone batch upsert
     
@@ -280,23 +214,26 @@ def prepare_pinecone_batch(chunks: list, embeddings: np.ndarray, file_id: str, f
         file_id: Unique identifier for the file
         filename: Name of the file
         page_numbers: Optional list of page numbers corresponding to each chunk
-        conversation_id: Optional conversation ID to associate with these chunks
     """
     batch_data = []
     for i, (chunk, embedding) in enumerate(zip(chunks, embeddings)):
-        metadata = {
-            'text': chunk,
-            'source': filename,
-            'chunk_id': i
-        }
+        if conversation_id:
+            metadata = {
+                'text': chunk,
+                # 'conversation_id': conversation_id,
+                'source': filename,
+                'chunk_id': i
+            }
+        else:
+            metadata = {
+                'text': chunk,
+                'source': filename,
+                'chunk_id': i
+            }
         
-        # Add page number if available
+        # Add page number to metadata if available
         if page_numbers and i < len(page_numbers):
             metadata['page'] = page_numbers[i]
-            
-        # Add conversation ID if available
-        if conversation_id:
-            metadata['conversation_id'] = conversation_id
         
         batch_data.append({
             'id': f"{file_id}_chunk_{i}",
@@ -339,7 +276,7 @@ def upsert_to_pinecone(index, batch_data: list, batch_size: int = 100) -> None:
         logger.error(f"Error in upsert_to_pinecone: {str(e)}")
         raise
 
-def process_pdf_chunk(page_data, file_id, filename, conversation_id=None):
+def process_pdf_chunk(page_data, file_id, filename, conversation_id:str = None):
     """
     Process a chunk of PDF pages, create embeddings and upsert to Pinecone
     
@@ -347,7 +284,6 @@ def process_pdf_chunk(page_data, file_id, filename, conversation_id=None):
         page_data: List of dictionaries with 'pageNum' and 'text' keys
         file_id: Unique identifier for the file
         filename: Name of the file
-        conversation_id: Optional conversation ID to associate with these chunks
     
     Returns:
         Number of chunks processed
@@ -398,14 +334,9 @@ def process_pdf_chunk(page_data, file_id, filename, conversation_id=None):
         index = create_or_get_index(PINECONE_INDEX_NAME, EMBEDDING_DIMENSION)
         
         # Prepare batch data
-        batch_data = prepare_pinecone_batch(
-            chunks, 
-            embeddings, 
-            file_id, 
-            filename, 
-            chunk_page_numbers,
-            conversation_id
-        )
+        batch_data = prepare_pinecone_batch(chunks, embeddings, file_id, filename, 
+                                             conversation_id = conversation_id,
+                                             page_numbers=chunk_page_numbers)
         
         # Upsert to Pinecone
         upsert_to_pinecone(index, batch_data)
@@ -417,18 +348,8 @@ def process_pdf_chunk(page_data, file_id, filename, conversation_id=None):
         logger.error(f"Error processing PDF chunk: {str(e)}")
         raise
 
-def search_pinecone(query: str, top_k: int = 10, filters: dict = None) -> list:
-    """
-    Search Pinecone index for similar chunks
-    
-    Args:
-        query: The search query
-        top_k: Number of results to return
-        filters: Optional metadata filters (e.g., {'conversation_id': 'abc123'})
-        
-    Returns:
-        List of search results
-    """
+def search_pinecone(query: str, conversation_id: str = None, top_k: int = 10) -> list:
+    """Search Pinecone index for similar chunks"""
     try:
         # Initialize Pinecone if not already initialized
         global pc
@@ -446,21 +367,26 @@ def search_pinecone(query: str, top_k: int = 10, filters: dict = None) -> list:
         )
         query_embedding = response.data[0].embedding
         
-        # Prepare query parameters
-        query_params = {
-            "vector": query_embedding,
-            "top_k": top_k,
-            "include_metadata": True
-        }
-        
-        # Add filter if provided
-        if filters:
-            query_params["filter"] = filters
-        
         # Search Pinecone using the index's query method
-        search_results = index.query(**query_params)
+        search_results = None
+        if conversation_id:
+            search_results = index.query(
+                vector=query_embedding,
+                top_k=top_k,
+                include_metadata=True,
+                filter={
+                    'conversation_id': conversation_id
+                }
+            )
+        else:
+            search_results = index.query(
+                vector=query_embedding,
+                top_k=top_k,
+                include_metadata=True
+            )
+            
         logger.info(f"Search results: {len(search_results.matches)} matches found")
-        
+        # logger.debug(f"Search results: {json.dumps(search_results.matches, indent=2)}")
         # Format results
         results = []
         for match in search_results.matches:
@@ -483,7 +409,7 @@ def search_pinecone(query: str, top_k: int = 10, filters: dict = None) -> list:
         logger.error(f"Error searching Pinecone: {e}")
         raise
 
-def get_relevant_context(user_query: str, threshold: float = SIMILARITY_THRESHOLD, max_results: int = 5, filters: dict = None) -> tuple:
+def get_relevant_context(user_query: str, conversation_id:str, threshold: float = SIMILARITY_THRESHOLD, max_results: int = 5) -> tuple:
     """
     Performs similarity search for a user query and returns relevant context
     that exceeds the similarity threshold.
@@ -492,7 +418,6 @@ def get_relevant_context(user_query: str, threshold: float = SIMILARITY_THRESHOL
         user_query: The user's question or query
         threshold: Minimum similarity score to include a chunk (0-1)
         max_results: Maximum number of results to return
-        filters: Optional metadata filters (e.g., {'conversation_id': 'abc123'})
         
     Returns:
         Tuple of (context_text, sources) where:
@@ -501,9 +426,8 @@ def get_relevant_context(user_query: str, threshold: float = SIMILARITY_THRESHOL
     """
     try:
         # Get search results
-        search_results = search_pinecone(user_query, top_k=max_results*2, filters=filters)  # Get more than needed to filter
+        search_results = search_pinecone(user_query, top_k=max_results*2, conversation_id=conversation_id)  # Get more than needed to filter
         logger.info(f"Search results for query '{user_query}': {len(search_results)} results")
-        
         # Filter results by threshold
         filtered_results = [result for result in search_results if result['score'] >= threshold]
         
@@ -543,6 +467,67 @@ def get_relevant_context(user_query: str, threshold: float = SIMILARITY_THRESHOL
         
     except Exception as e:
         logger.error(f"Error getting relevant context: {e}")
+        raise
+
+def generate_answer_with_context(user_query: str, model: str = "gpt-4o-mini") -> dict:
+    """
+    Generate an answer to a user query using context from the vector database.
+    
+    Args:
+        user_query: The user's question
+        model: The OpenAI model to use for generating the answer
+        
+    Returns:
+        Dictionary containing the answer, sources, and whether relevant context was found
+    """
+    try:
+        # Get relevant context
+        context, sources = get_relevant_context(user_query)
+        
+        # If no relevant context found
+        if not context:
+            return {
+                "answer": "I couldn't find relevant information in the uploaded documents to answer your question.",
+                "sources": [],
+                "has_context": False
+            }
+        
+        # Create prompt with context
+        prompt = f"""You are a helpful assistant that answers questions based on the provided context.
+                    Answer the question based ONLY on the context provided.
+                    If the context doesn't contain the information needed to answer the question, say "I don't have enough information to answer that question."
+                    Do not use any prior knowledge.
+
+                    CONTEXT:
+                    {context}
+
+                    QUESTION:
+                    {user_query}
+
+                    ANSWER:"""
+        
+        # Generate answer with OpenAI
+        client = OpenAI(api_key=os.getenv('OPENAI_API_KEY'))
+        completion = client.chat.completions.create(
+            model=model,
+            messages=[
+                {"role": "system", "content": "You are a helpful assistant that answers questions based on specific context provided."},
+                {"role": "user", "content": prompt}
+            ],
+            temperature=0.2,
+            max_tokens=1000
+        )
+        
+        answer = completion.choices[0].message.content
+        
+        return {
+            "answer": answer,
+            "sources": sources,
+            "has_context": True
+        }
+        
+    except Exception as e:
+        logger.error(f"Error generating answer: {e}")
         raise
 
 def delete_all_embeddings_from_index(index_name: str = PINECONE_INDEX_NAME):
@@ -617,13 +602,78 @@ def delete_all_embeddings_from_index(index_name: str = PINECONE_INDEX_NAME):
     except Exception as e:
         logger.error(f"Error deleting vectors from index: {e}")
         return False
-
+    
 if __name__ == "__main__":
     # Initialize Pinecone
     initialize_pinecone()
-    
-    # Example: Test connectivity
-    if pc is not None:
-        print("Pinecone initialized successfully")
-    else:
-        print("Failed to initialize Pinecone")
+    delete_all_embeddings_from_index()
+    # for testing
+    # if pc is not None:
+        # try:
+        #     # List the indices to verify connection
+        #     indices = pc.list_indexes()
+        #     index_names = [index.name for index in indices]
+        #     print(f"Pinecone indices: {index_names}")
+            
+        #     # Test with a sample PDF
+        #     sample_pdf_path = "sample.pdf"
+            
+        #     if os.path.exists(sample_pdf_path):
+        #         print(f"\nTesting with {sample_pdf_path}...")
+                
+        #         # Read the PDF file
+        #         with open(sample_pdf_path, "rb") as f:
+        #             pdf_bytes = f.read()
+                
+        #         # Create a unique file ID
+        #         file_id = f"test_{int(time.time())}"
+                
+        #         # Extract text from the PDF
+        #         print("Extracting text from PDF...")
+        #         text = extract_text_from_pdf_bytes(pdf_bytes=pdf_bytes)
+        #         print(f"Extracted {len(text)} characters of text")
+                
+        #         # Create chunks
+        #         print("Creating text chunks...")
+        #         chunks = chunk_text(text, CHUNK_SIZE, CHUNK_OVERLAP)
+        #         print(f"Created {len(chunks)} chunks")
+                
+        #         # Create embeddings
+        #         print("Creating embeddings...")
+        #         embeddings = create_embeddings(chunks)
+        #         print(f"Created {len(embeddings)} embeddings")
+                
+        #         # Prepare batch data for Pinecone
+        #         print("Preparing batch data for Pinecone...")
+        #         batch_data = prepare_pinecone_batch(chunks, embeddings, file_id, sample_pdf_path)
+                
+        #         # Get or create Pinecone index
+        #         print("Getting Pinecone index...")
+        #         index = create_or_get_index(PINECONE_INDEX_NAME, EMBEDDING_DIMENSION)
+                
+        #         # Upsert to Pinecone
+        #         print("Upserting data to Pinecone...")
+        #         upsert_to_pinecone(index, batch_data)
+                
+        #         time.sleep(8)
+        #         # Test query
+        #         test_query = "what is the document about?"
+        #         print(f"\nTesting query: '{test_query}'")
+
+        #         # Get results
+        #         print("Generating answer with context...")
+        #         result = generate_answer_with_context(test_query)
+                
+        #         # Display the result
+        #         print("\n--- RESULT ---")
+        #         print(f"Answer: {result['answer']}")
+        #         print(f"Sources: {result['sources']}")
+        #         print(f"Has context: {result['has_context']}")
+                
+        #     else:
+        #         print(f"Error: {sample_pdf_path} not found. Please place a sample PDF file in the same directory.")
+                
+        # except Exception as e:
+        #     print(f"Error during testing: {e}")
+    # else:
+    #     print("Pinecone client is not initialized")

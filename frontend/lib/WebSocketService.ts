@@ -10,15 +10,6 @@ interface UploadStatus {
   message?: string;
 }
 
-interface QueryResult {
-  queryId: string;
-  status: 'processing' | 'completed' | 'error';
-  answer?: string;
-  sources?: string[];
-  has_context?: boolean;
-  error?: string;
-}
-
 export class WebSocketService {
   private socket: Socket | null = null;
   private listeners: { [event: string]: ((data: any) => void)[] } = {};
@@ -27,6 +18,8 @@ export class WebSocketService {
   private reconnectInterval = 2000; // 2 seconds
   private isConnecting = false;
   private isReconnecting = false;
+  private tokenBuffer: string[] = []; // Buffer for token batching
+  private tokenTimerId: NodeJS.Timeout | null = null;
 
   constructor(private url: string = 'http://localhost:5001') {
     this.connect();
@@ -54,13 +47,12 @@ export class WebSocketService {
         reconnectionAttempts: this.maxReconnectAttempts,
         reconnectionDelay: this.reconnectInterval,
         timeout: 20000,
-        // Disable automatic reconnection to handle it manually
         autoConnect: true,
         forceNew: true
       });
 
       this.socket.on('connect', () => {
-        console.log('WebSocket connected');
+        console.log('WebSocket connected with ID:', this.socket?.id);
         this.isConnecting = false;
         this.isReconnecting = false;
         this.reconnectAttempts = 0;
@@ -90,7 +82,7 @@ export class WebSocketService {
       });
 
       this.socket.on('connect_error', (error) => {
-        // console.error('Connection error:', error);
+        console.error('Connection error:', error);
         this.isConnecting = false;
         this.reconnectAttempts++;
         
@@ -107,37 +99,46 @@ export class WebSocketService {
         }
       });
 
-      // Forward all server events to our listeners
-      this.socket.onAny((eventName, ...args) => {
-        if (this.listeners[eventName]) {
-          this.listeners[eventName].forEach(callback => callback(args[0]));
-        }
-      });
-
-      // Set up specific listeners to handle upload events
+      // Set up specific listeners for progress updates
       this.socket.on('upload_progress', (data) => {
         console.log('Upload progress received:', data);
         this.emit('upload_progress', data);
       });
 
-      this.socket.on('upload_started', (data) => {
-        console.log('Upload started:', data);
-        this.emit('upload_started', data);
+      // Add listeners for streaming tokens with batching for smoother animation
+      this.socket.on('token', (data) => {
+        if (data && data.token) {
+          // Add token to buffer
+          this.tokenBuffer.push(data.token);
+          
+          // If timer is not running, start it
+          if (!this.tokenTimerId) {
+            this.tokenTimerId = setTimeout(() => {
+              this.flushTokenBuffer();
+            }, 16); // ~60fps refresh rate (16ms)
+          }
+        }
       });
 
-      // Set up listeners for query events
+      // Add listeners for query processing status
       this.socket.on('query_processing', (data) => {
         console.log('Query processing:', data);
         this.emit('query_processing', data);
       });
 
+      // Add listeners for query results
       this.socket.on('query_result', (data) => {
-        console.log('Query result received:', data);
+        console.log('Query result:', data);
+        // Flush any remaining tokens
+        this.flushTokenBuffer();
         this.emit('query_result', data);
       });
 
+      // Add listeners for query errors
       this.socket.on('query_error', (data) => {
         console.error('Query error:', data);
+        // Flush any remaining tokens
+        this.flushTokenBuffer();
         this.emit('query_error', data);
       });
 
@@ -148,6 +149,22 @@ export class WebSocketService {
     } catch (error) {
       console.error('Error initializing socket:', error);
       this.isConnecting = false;
+    }
+  }
+
+  // Flush token buffer to emit tokens with better performance
+  private flushTokenBuffer() {
+    if (this.tokenBuffer.length > 0) {
+      const combinedToken = this.tokenBuffer.join('');
+      console.log(`Flushing ${this.tokenBuffer.length} tokens: "${combinedToken.substring(0, 20)}${combinedToken.length > 20 ? '...' : ''}"`);
+      this.emit('token', { token: combinedToken });
+      this.tokenBuffer = [];
+    }
+    
+    // Clear the timer
+    if (this.tokenTimerId) {
+      clearTimeout(this.tokenTimerId);
+      this.tokenTimerId = null;
     }
   }
 
@@ -180,131 +197,32 @@ export class WebSocketService {
       return false;
     }
     
-    console.log(`Sending ${event} event:`, data.fileName || data);
+    console.log(`Sending ${event} event:`, data.query ? `query: ${data.query.substring(0, 30)}...` : data);
     this.socket.emit(event, data);
     return true;
   }
 
-  public uploadPdf(file: File): Promise<string> {
-    return new Promise((resolve, reject) => {
-      if (!this.socket) {
-        reject(new Error('Socket not initialized'));
-        this.connect();
-        return;
-      }
-      
-      if (!this.socket.connected) {
-        reject(new Error('Socket not connected'));
-        this.connect();
-        return;
-      }
-
-      const uploadId = `upload-${Date.now()}-${Math.random().toString(36).substring(2, 9)}`;
-      
-      // Set up listener for this upload
-      const unsubscribe = this.on('upload_progress', (data: UploadStatus) => {
-        if (data.id === uploadId) {
-          if (data.status === 'completed' && data.fileId) {
-            unsubscribe();
-            resolve(data.fileId);
-          } else if (data.status === 'error') {
-            unsubscribe();
-            reject(new Error(data.error || 'Upload failed'));
-          }
-        }
-      });
-
-      // Read file as base64
-      const reader = new FileReader();
-      reader.onloadend = () => {
-        // Send to server - the entire file at once for simplicity
-        this.send('upload_pdf', {
-          uploadId,
-          fileName: file.name,
-          fileData: reader.result
-        });
-      };
-      reader.onerror = () => {
-        unsubscribe();
-        reject(new Error('Failed to read file'));
-      };
-      reader.readAsDataURL(file);
-    });
+  public getSocketId(): string | null {
+    return this.socket?.id || null;
   }
 
-  public searchPdfContent(query: string): Promise<any> {
-    return fetch(`${this.url}/api/search`, {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-      },
-      body: JSON.stringify({ query }),
-    }).then(response => response.json());
-  }
-
-  public queryPdfContent(query: string, model: string = 'gpt-4o-mini'): Promise<any> {
-    return fetch(`${this.url}/api/query`, {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-      },
-      body: JSON.stringify({ query, model }),
-    }).then(response => response.json());
-  }
-
-  public queryPdfContentRealtime(query: string, model: string = 'gpt-4o-mini'): Promise<QueryResult> {
-    return new Promise((resolve, reject) => {
-      if (!this.socket) {
-        reject(new Error('Socket not initialized'));
-        this.connect();
-        return;
-      }
-      
-      if (!this.socket.connected) {
-        reject(new Error('Socket not connected'));
-        this.connect();
-        return;
-      }
-
-      const queryId = `query-${Date.now()}-${Math.random().toString(36).substring(2, 9)}`;
-      
-      // Set up listeners for the query
-      const unsubscribeResult = this.on('query_result', (data: QueryResult) => {
-        if (data.queryId === queryId) {
-          unsubscribeResult();
-          unsubscribeError();
-          resolve(data);
-        }
-      });
-      
-      const unsubscribeError = this.on('query_error', (data: QueryResult) => {
-        if (data.queryId === queryId) {
-          unsubscribeResult();
-          unsubscribeError();
-          reject(new Error(data.error || 'Query failed'));
-        }
-      });
-
-      // Send query through WebSocket
-      this.send('query', {
-        queryId,
-        query,
-        model
-      });
-    });
+  public isConnected(): boolean {
+    return !!this.socket?.connected;
   }
 
   public disconnect() {
+    // Clear any pending token flush
+    if (this.tokenTimerId) {
+      clearTimeout(this.tokenTimerId);
+      this.tokenTimerId = null;
+    }
+    
     if (this.socket) {
       this.socket.disconnect();
       this.socket = null;
       this.isConnecting = false;
       this.isReconnecting = false;
     }
-  }
-
-  public isConnected(): boolean {
-    return !!this.socket?.connected;
   }
 }
 

@@ -1,3 +1,5 @@
+/* components/Sidebar.tsx*/
+
 import React, { useState, useEffect, useRef } from 'react';
 import { Message } from '../app/page';
 

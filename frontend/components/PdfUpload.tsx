@@ -1,3 +1,5 @@
+/* components/PdfUpload.tsx*/
+
 import React from 'react';
 import { X, Upload, FileText, Loader2, Database, Zap, FileStack, BookOpen } from 'lucide-react';
 

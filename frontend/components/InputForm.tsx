@@ -3,10 +3,6 @@ import { MessageSquare } from 'lucide-react';
 import { useDropzone } from 'react-dropzone';
 import PdfUpload from './PdfUpload';
 import { socketService } from '@/lib/WebSocketService';
-import { pdfjs } from 'react-pdf';
-
-// Initialize PDF.js worker
-pdfjs.GlobalWorkerOptions.workerSrc = `//cdnjs.cloudflare.com/ajax/libs/pdf.js/${pdfjs.version}/pdf.worker.min.js`;
 
 interface UploadStatus {
   id: string;
@@ -25,22 +21,20 @@ interface InputFormProps {
   pdfs: File[];
   onPdfUpload: (files: File[]) => void;
   onRemovePdf: (index: number) => void;
-  onStreamStart: () => void;
-  onStreamToken: (token: string) => void;
-  onStreamEnd: (answer: string, sources: string[]) => void;
+  onQueryResponse: (answer: string, sources: string[]) => void;
+  onStreamToken: (token: string) => void; // New prop for streaming tokens
   conversationId?: string;
 }
 
-const PAGES_PER_CHUNK = 10;
+const API_URL = 'http://localhost:5001';
 
 const InputForm: React.FC<InputFormProps> = ({ 
   onSubmit, 
   pdfs, 
   onPdfUpload, 
   onRemovePdf,
-  onStreamStart,
+  onQueryResponse,
   onStreamToken,
-  onStreamEnd,
   conversationId
 }) => {
   const [isUploadVisible, setIsUploadVisible] = useState<boolean>(false);
@@ -48,11 +42,11 @@ const InputForm: React.FC<InputFormProps> = ({
   const [uploadedPdfIds, setUploadedPdfIds] = useState<string[]>([]);
   const [isConnected, setIsConnected] = useState<boolean>(false);
   const [isMessageLoading, setIsMessageLoading] = useState<boolean>(false);
-  const [isStreaming, setIsStreaming] = useState<boolean>(false);
+  const [currentUploadId, setCurrentUploadId] = useState<string | null>(null);
   const [currentQueryId, setCurrentQueryId] = useState<string | null>(null);
   const inputRef = useRef<HTMLInputElement>(null);
 
-  // Connect to WebSocket and set up event listeners
+  // Connect to WebSocket for progress updates and streaming
   useEffect(() => {
     // Handle connection status
     const unsubscribeConnected = socketService.on('connected', () => {
@@ -98,10 +92,7 @@ const InputForm: React.FC<InputFormProps> = ({
       });
 
       // Add completed file ID to the list when all processing is done
-      if (data.status === 'completed' && data.fileId && 
-          data.processedPages !== undefined && 
-          data.totalPages !== undefined && 
-          data.processedPages >= data.totalPages) {
+      if (data.status === 'completed' && data.fileId) {
         setUploadedPdfIds(prev => {
           if (!prev.includes(data.fileId)) {
             return [...prev, data.fileId];
@@ -111,28 +102,41 @@ const InputForm: React.FC<InputFormProps> = ({
       }
     });
 
-    // Set up streaming handlers
-    const unsubscribeTokenStream = socketService.on('token_stream', (data) => {
-      if (data.queryId === currentQueryId) {
+    // Handle streaming token events
+    const unsubscribeToken = socketService.on('token', (data) => {
+      console.log('Token received in InputForm:', data);
+      if (data && data.token) {
+        // Call the onStreamToken callback with the token
         onStreamToken(data.token);
       }
     });
 
+    // Handle query processing status
+    const unsubscribeQueryProcessing = socketService.on('query_processing', (data) => {
+      console.log('Query processing:', data);
+      // Set loading state if not already set
+      if (!isMessageLoading) {
+        setIsMessageLoading(true);
+      }
+    });
+
+    // Handle query results
     const unsubscribeQueryResult = socketService.on('query_result', (data) => {
+      console.log('Query result received:', data);
       if (data.queryId === currentQueryId) {
-        setIsStreaming(false);
+        // Complete the query with the final answer and sources
+        onQueryResponse(data.answer, data.sources || []);
         setIsMessageLoading(false);
-        onStreamEnd(data.answer, data.sources || []);
         setCurrentQueryId(null);
       }
     });
 
+    // Handle query errors
     const unsubscribeQueryError = socketService.on('query_error', (data) => {
-      if (data.queryId === currentQueryId) {
-        setIsStreaming(false);
+      console.error('Query error:', data);
+      if (data.queryId === currentQueryId || currentQueryId === null) {
+        onQueryResponse(`Error: ${data.error || 'Unknown error'}`, []);
         setIsMessageLoading(false);
-        // Send error message to chat
-        onStreamEnd(`Error: ${data.error || 'An error occurred during processing.'}`, []);
         setCurrentQueryId(null);
       }
     });
@@ -142,120 +146,24 @@ const InputForm: React.FC<InputFormProps> = ({
       unsubscribeConnected();
       unsubscribeDisconnected();
       unsubscribeProgress();
-      unsubscribeTokenStream();
+      unsubscribeToken();
+      unsubscribeQueryProcessing();
       unsubscribeQueryResult();
       unsubscribeQueryError();
     };
-  }, [currentQueryId, onStreamToken, onStreamEnd]);
+  }, [onStreamToken, onQueryResponse, currentQueryId, isMessageLoading]);
 
-  // Process PDF in chunks and send them to the server
-  const processPdfInChunks = async (file: File, uploadId: string) => {
-    try {
-      // Read the PDF file
-      const arrayBuffer = await file.arrayBuffer();
-      const pdf = await pdfjs.getDocument({ data: arrayBuffer }).promise;
-      
-      const totalPages = pdf.numPages;
-      
-      // Update status with total pages
-      setUploadStatuses(prev => {
-        const index = prev.findIndex(status => status.id === uploadId);
-        if (index >= 0) {
-          const newStatuses = [...prev];
-          newStatuses[index] = {
-            ...newStatuses[index],
-            totalPages,
-            processedPages: 0
-          };
-          return newStatuses;
-        }
-        return prev;
-      });
-      
-      // Generate a file ID to use across chunks
-      const fileId = `file-${Date.now()}-${Math.random().toString(36).substring(2, 9)}`;
-      
-      // Process pages in chunks
-      let processedPages = 0;
-      for (let startPage = 1; startPage <= totalPages; startPage += PAGES_PER_CHUNK) {
-        const endPage = Math.min(startPage + PAGES_PER_CHUNK - 1, totalPages);
-        const chunkPages = endPage - startPage + 1;
-        
-        // Extract text from pages in this chunk
-        const pageTexts = [];
-        for (let pageNum = startPage; pageNum <= endPage; pageNum++) {
-          const page = await pdf.getPage(pageNum);
-          const textContent = await page.getTextContent();
-          const pageText = textContent.items.map(item => 'str' in item ? item.str : '').join(' ');
-          pageTexts.push({ pageNum, text: pageText });
-        }
-        
-        // Create a chunk ID for this set of pages
-        const chunkId = `${uploadId}_chunk_${startPage}_${endPage}`;
-        
-        // Send this chunk to the server
-        socketService.send('upload_pdf_chunk', {
-          uploadId,
-          fileId,
-          fileName: file.name,
-          chunkId,
-          startPage,
-          endPage,
-          totalPages,
-          pageData: pageTexts
-        });
-        
-        processedPages += chunkPages;
-        
-        // Update status with processed pages
-        setUploadStatuses(prev => {
-          const index = prev.findIndex(status => status.id === uploadId);
-          if (index >= 0) {
-            const newStatuses = [...prev];
-            newStatuses[index] = {
-              ...newStatuses[index],
-              processedPages,
-              fileId // Make sure we set the fileId
-            };
-            return newStatuses;
-          }
-          return prev;
-        });
-        
-        // Small delay to avoid overwhelming the server
-        await new Promise(resolve => setTimeout(resolve, 100));
-      }
-      
-    } catch (error) {
-      console.error('Error processing PDF:', error);
-      
-      // Update status with error
-      setUploadStatuses(prev => {
-        const index = prev.findIndex(status => status.id === uploadId);
-        if (index >= 0) {
-          const newStatuses = [...prev];
-          newStatuses[index] = {
-            ...newStatuses[index],
-            status: 'error',
-            error: 'Failed to process PDF: ' + (error instanceof Error ? error.message : String(error))
-          };
-          return newStatuses;
-        }
-        return prev;
-      });
-    }
-  };
-
-  // Handle PDF upload
+  // Handle PDF upload via HTTP
   const handlePdfUpload = async (files: File[]) => {
     if (files.length === 0) return;
     
     // First update UI
     onPdfUpload(files);
     
-    // For each file, create an initial status and process in chunks
-    files.forEach(file => {
+    // Process each file
+    for (const file of files) {
       const uploadId = `upload-${Date.now()}-${Math.random().toString(36).substring(2, 9)}`;
+      setCurrentUploadId(uploadId);
       
       // Add to status tracking
       setUploadStatuses(prev => [
@@ -266,15 +174,51 @@ const InputForm: React.FC<InputFormProps> = ({
           fileName: file.name,
           progress: 0,
           status: 'uploading',
-          message: 'Analyzing PDF...'
+          message: 'Preparing upload...'
         }
       ]);
       
-      // Process PDF in chunks
-      processPdfInChunks(file, uploadId).catch(error => {
-        console.error('Error in PDF processing:', error);
-      });
-    });
+      try {
+        // Create form data
+        const formData = new FormData();
+        formData.append('file', file);
+        formData.append('uploadId', uploadId);
+        formData.append('socketId', socketService.getSocketId() || '');
+        
+        // Send the file via HTTP POST
+        const response = await fetch(`${API_URL}/api/upload-pdf`, {
+          method: 'POST',
+          body: formData
+        });
+        
+        const result = await response.json();
+        
+        if (!response.ok) {
+          throw new Error(result.error || 'Failed to upload PDF');
+        }
+        
+        // If upload was successful but processing will continue via WebSocket
+        console.log('Upload successful, processing continues via WebSocket updates');
+        
+      } catch (error) {
+        console.error('Error uploading PDF:', error);
+        
+        // Update status with error
+        setUploadStatuses(prev => {
+          const index = prev.findIndex(status => status.id === uploadId);
+          if (index >= 0) {
+            const newStatuses = [...prev];
+            newStatuses[index] = {
+              ...newStatuses[index],
+              status: 'error',
+              error: 'Failed to upload: ' + (error instanceof Error ? error.message : String(error))
+            };
+            return newStatuses;
+          }
+          return prev;
+        });
+      }
+    }
   };
 
   const onDrop = useCallback((acceptedFiles: File[]) => {
@@ -297,27 +241,72 @@ const InputForm: React.FC<InputFormProps> = ({
     // If message is empty and no PDFs, do nothing
     if (!message.trim() && uploadedPdfIds.length === 0) return;
     
-    // Pass the message to parent component (this will display the user message)
+    // Pass the message to parent component to display the user message
     onSubmit(message, uploadedPdfIds);
     
-    // Start streaming response
+    // Set loading state
     setIsMessageLoading(true);
-    setIsStreaming(true);
-    onStreamStart();
     
-    // Generate a query ID
+    // Generate a unique query ID
     const queryId = `query-${Date.now()}-${Math.random().toString(36).substring(2, 9)}`;
     setCurrentQueryId(queryId);
     
-    // Send the query via WebSocket
-    socketService.send('query', {
-      query: message,
-      queryId: queryId,
-      conversationId: conversationId
-    });
+    // Use WebSocket for streaming instead of HTTP
+    if (socketService.isConnected()) {
+      // Send query via WebSocket
+      const success = socketService.send('query', {
+        query: message,
+        model: 'gpt-4o-mini',
+        queryId: queryId,
+        conversationId: conversationId
+      });
+      
+      console.log('Query sent via WebSocket:', success);
+      
+      // If the WebSocket send fails, fall back to HTTP
+      if (!success) {
+        fallbackToHttpQuery(message, queryId);
+      }
+    } else {
+      console.log('WebSocket not connected, using HTTP fallback');
+      fallbackToHttpQuery(message, queryId);
+    }
     
     // Reset the form after submission
     (e.target as HTMLFormElement).reset();
+  };
+  
+  // Fallback to HTTP query if WebSocket is not available
+  const fallbackToHttpQuery = async (message: string, queryId: string) => {
+    try {
+      const response = await fetch(`${API_URL}/api/query`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json'
+        },
+        body: JSON.stringify({
+          query: message,
+          model: 'gpt-4o-mini',
+          conversationId: conversationId
+        })
+      });
+      
+      if (!response.ok) {
+        throw new Error(`Error: ${response.status} ${response.statusText}`);
+      }
+      
+      const result = await response.json();
+      
+      // Call onQueryResponse with the result
+      onQueryResponse(result.answer, result.sources || []);
+      setIsMessageLoading(false);
+      setCurrentQueryId(null);
+    } catch (error) {
+      console.error('Error querying:', error);
+      onQueryResponse(`Error: ${error instanceof Error ? error.message : 'Unknown error'}`, []);
+      setIsMessageLoading(false);
+      setCurrentQueryId(null);
+    }
   };
 
   // Calculate overall upload progress
@@ -421,15 +410,15 @@ const InputForm: React.FC<InputFormProps> = ({
               ? `Uploading PDFs (${overallProgress}%)...` 
               : "Type your message or drop PDFs here..."}
             className="w-full bg-[#1A1A1A] rounded-lg px-4 py-2 text-gray-200 placeholder-gray-500 focus:outline-none focus:ring-2 focus:ring-gray-600"
-            disabled={isMessageLoading || isStreaming}
+            disabled={isMessageLoading}
           />
         </div>
         <button
           type="submit"
           className={`bg-[#2A2A2A] hover:bg-[#3A3A3A] rounded-lg px-4 py-2 flex items-center gap-2 text-gray-200 ${
-            isMessageLoading || isStreaming ? 'opacity-70 cursor-wait' : ''
+            isMessageLoading ? 'opacity-70 cursor-wait' : ''
           }`}
-          disabled={isMessageLoading || isStreaming}
+          disabled={isMessageLoading}
         >
           <MessageSquare className="w-5 h-5" />
           Send

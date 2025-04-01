@@ -1,3 +1,4 @@
+# conversation.py
 import os
 import logging
 import time
@@ -15,7 +16,6 @@ from rag_utils import (
     SIMILARITY_THRESHOLD
 )
 
-# Create an instance of the conversation manager (initialized at the end of the file)
 
 # Configure logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
@@ -90,7 +90,26 @@ class ConversationManager:
         """Initialize the conversation manager"""
         # The actual conversations data is stored in the global cache
         # and MongoDB for persistence
+        self.collection = get_mongodb_connection()
         pass
+    
+    def get_all_conversations(self) -> List[str]:
+        """
+        Get all conversations from MongoDB
+        
+        Returns:
+            List of conversation documents
+        """
+        try:
+            collection = self.collection
+            cursor = collection.find({})
+            doc = list(cursor)
+            conversation_ids = [doc.get("conversation_id",None) for doc in doc]
+            logger.info(f"Retrieved {len(conversation_ids)} conversations from MongoDB")
+            return conversation_ids
+        except Exception as e:
+            logger.error(f"Error retrieving conversations from MongoDB: {e}")
+            return []
     
     def get_conversation(self, conversation_id: str) -> List[Dict[str, str]]:
         """
@@ -114,7 +133,7 @@ class ConversationManager:
         
         # Not in cache, try to get from MongoDB
         try:
-            collection = get_mongodb_connection()
+            collection = self.collection
             conversation_doc = collection.find_one({"conversation_id": conversation_id})
             
             if conversation_doc:
@@ -190,7 +209,7 @@ class ConversationManager:
         
         # Update MongoDB
         try:
-            collection = get_mongodb_connection()
+            collection = self.collection
             collection.update_one(
                 {"conversation_id": conversation_id},
                 {
@@ -233,7 +252,7 @@ class ConversationManager:
             
             # Update MongoDB
             try:
-                collection = get_mongodb_connection()
+                collection = self.collection
                 collection.update_one(
                     {"conversation_id": conversation_id},
                     {
@@ -271,7 +290,7 @@ class ConversationManager:
             
             # Remove from MongoDB
             try:
-                collection = get_mongodb_connection()
+                collection = self.collection
                 result = collection.delete_one({"conversation_id": conversation_id})
                 
                 if result.deleted_count > 0:
@@ -294,7 +313,7 @@ class ConversationManager:
             List of conversation IDs
         """
         try:
-            collection = get_mongodb_connection()
+            collection = self.collection
             cursor = collection.find({}, {"conversation_id": 1, "_id": 0})
             ids = [doc["conversation_id"] for doc in cursor]
             
@@ -316,7 +335,7 @@ class ConversationManager:
             Dictionary of metadata
         """
         try:
-            collection = get_mongodb_connection()
+            collection = self.collection
             doc = collection.find_one(
                 {"conversation_id": conversation_id},
                 {"metadata": 1, "created_at": 1, "last_updated": 1, "_id": 0}
@@ -353,7 +372,7 @@ class ConversationManager:
             True if successful, False otherwise
         """
         try:
-            collection = get_mongodb_connection()
+            collection = self.collection
             result = collection.update_one(
                 {"conversation_id": conversation_id},
                 {"$set": {"metadata": metadata, "last_updated": datetime.utcnow()}},
@@ -398,36 +417,28 @@ def generate_answer_with_context_and_history(
     
     try:
         # Get relevant context
-        context, sources = get_relevant_context(user_query, filters=filters)
+        context, sources = get_relevant_context(user_query, conversation_id=conversation_id)
         
         # If no relevant context found
+        
         if not context:
-            answer = "I couldn't find relevant information in the uploaded documents to answer your question."
-            
-            # If we have a conversation ID, still add this to the history
-            if conversation_id:
-                conversation_manager.add_to_conversation(conversation_id, "user", user_query)
-                conversation_manager.add_to_conversation(conversation_id, "assistant", answer)
-            
-            return {
-                "answer": answer,
-                "sources": [],
-                "has_context": False,
-                "processing_time": round(time.time() - start_time, 2)
-            }
+            context_prompt = f"""You are answering a question generally.
+                    {user_query}
+                    """
         
         # Create prompt with context
-        context_prompt = f"""You are answering a question based on specific context provided.
-Answer the question based ONLY on the context provided.
-If the context doesn't contain the information needed to answer the question, say "I don't have enough information to answer that question."
-Do not use any prior knowledge outside what is provided in the context or conversation history.
+        else: 
+            context_prompt = f"""You are answering a question based on specific context provided.
+                    Answer the question based ONLY on the context provided.
+                    If the context doesn't contain the information needed to answer the question, say "I don't have enough information to answer that question."
+                    Do not use any prior knowledge outside what is provided in the context or conversation history.
 
-CONTEXT:
-{context}
+                    CONTEXT:
+                    {context}
 
-QUESTION:
-{user_query}
-"""
+                    QUESTION:
+                    {user_query}
+                    """
         
         # Initialize OpenAI client
         client = OpenAI(api_key=os.getenv('OPENAI_API_KEY'))
@@ -461,6 +472,7 @@ QUESTION:
         # Generate answer with OpenAI
         if streaming and socket_emit_func:
             # Handle streaming response
+            logger.info(f"Streaming enabled, will emit tokens via WebSocket")
             answer_chunks = []
             
             # Make streaming request
@@ -472,20 +484,24 @@ QUESTION:
                     answer_chunks.append(content)
                     
                     # Emit the token to the client
+                    logger.debug(f"Emitting token: {content}")
                     socket_emit_func('token', {'token': content})
+                    
+                    # Small delay to avoid overwhelming the client
+                    time.sleep(0.01)
             
             # Combine chunks into final answer
             answer = ''.join(answer_chunks)
+            logger.info(f"Streaming complete, total response length: {len(answer)}")
         else:
             # Non-streaming request
+            logger.info(f"Using non-streaming request")
             completion = client.chat.completions.create(**request_params)
             answer = completion.choices[0].message.content
-        
+            
         # Add to conversation history if we have a conversation ID
         if conversation_id:
-            # Original query
             conversation_manager.add_to_conversation(conversation_id, "user", user_query)
-            # Assistant's response
             conversation_manager.add_to_conversation(conversation_id, "assistant", answer)
         
         elapsed_time = time.time() - start_time
@@ -540,6 +556,21 @@ def clear_conversation(conversation_id: str) -> bool:
 
 # Initialize the conversation manager
 conversation_manager = ConversationManager()
+
+# wrapper for get_all_conversations
+def get_all_conversations_from_db() -> List[str]:
+    """
+    Get all conversation IDs from MongoDB
+    
+    Returns:
+        List of conversation IDs
+    """
+    try:
+        return conversation_manager.get_all_conversations()
+    except Exception as e:
+        logger.error(f"Error retrieving conversations from MongoDB: {e}")
+        return []
+
 
 # Example Flask API routes (commented out for reference):
 """
@@ -628,37 +659,42 @@ def handle_query(data):
 
 if __name__ == "__main__":
     # Example usage
-    conversation_id = f"test-{uuid.uuid4()}"
-    print(f"Testing with conversation ID: {conversation_id}")
+    try:
+        get_mongodb_connection()
+        print("MongoDB connection successful.")
+    except Exception as e:
+        print(f"MongoDB connection failed: {e}")
+    # conversation_id = f"test-{uuid.uuid4()}"
+    # print(f"Testing with conversation ID: {conversation_id}")
     
-    # First query
-    first_query = "What is this document about?"
-    print(f"\nFirst Query: '{first_query}'")
+    # # First query
+    # first_query = "What is this document about?"
+    # print(f"\nFirst Query: '{first_query}'")
     
-    result1 = generate_answer_with_context_and_history(
-        first_query,
-        conversation_id=conversation_id
-    )
+    # result1 = generate_answer_with_context_and_history(
+    #     first_query,
+    #     conversation_id=conversation_id
+    # )
     
-    print(f"Answer: {result1['answer']}")
-    print(f"Sources: {result1['sources']}")
+    # print(f"Answer: {result1['answer']}")
+    # print(f"Sources: {result1['sources']}")
     
-    # Second query that references the first
-    second_query = "Can you tell me more about that topic?"
-    print(f"\nSecond Query: '{second_query}'")
+    # # Second query that references the first
+    # second_query = "Can you tell me more about that topic?"
+    # print(f"\nSecond Query: '{second_query}'")
     
-    result2 = generate_answer_with_context_and_history(
-        second_query,
-        conversation_id=conversation_id
-    )
+    # result2 = generate_answer_with_context_and_history(
+    #     second_query,
+    #     conversation_id=conversation_id
+    # )
     
-    print(f"Answer: {result2['answer']}")
-    print(f"Sources: {result2['sources']}")
+    # print(f"Answer: {result2['answer']}")
+    # print(f"Sources: {result2['sources']}")
     
-    # Print the conversation history
-    history = conversation_manager.get_conversation(conversation_id)
-    print("\nConversation History:")
-    for msg in history:
-        role = msg["role"]
-        if role != "system":
-            print(f"{role.upper()}: {msg['content'][:100]}...")
+    # # Print the conversation history
+    # history = conversation_manager.get_conversation(conversation_id)
+    # print("\nConversation History:")
+    # for msg in history:
+    #     role = msg["role"]
+    #     if role != "system":
+    #         print(f"{role.upper()}: {msg['content'][:100]}...")

@@ -28,38 +28,63 @@ export default function Home() {
 
   useEffect(() => {
     scrollToBottom();
-  }, [messages, streamingContent]);
+  }, [messages]);
+
+  // Add new effect to handle scrolling during streaming
+  useEffect(() => {
+    if (streamingContent !== null) {
+      scrollToBottom();
+    }
+  }, [streamingContent]);
 
   const handleSubmit = async (message: string, uploadedPdfIds?: string[]) => {
     if (!message.trim()) return;
 
     // Add user message to chat
     setMessages(prev => [...prev, { role: 'user', content: message }]);
+    
+    // Reset streaming content and set loading state
+    setStreamingContent("");
     setIsLoading(true);
   };
 
-  const handleStreamStart = () => {
-    // Clear any previous streaming content
-    setStreamingContent('');
-  };
-
   const handleStreamToken = (token: string) => {
-    setStreamingContent(prev => (prev === null ? token : prev + token));
-    scrollToBottom();
+    console.log("Stream token received:", token);
+    
+    // Ensure we always update state with the new token
+    setStreamingContent(prev => {
+      const current = prev === null ? "" : prev;
+      return current + token;
+    });
+    
+    // Ensure we're scrolling to bottom with each token
+    setTimeout(scrollToBottom, 10);
   };
 
-  const handleStreamEnd = (answer: string, sources: string[]) => {
-    // Add completed message to chat
-    setMessages(prev => [...prev, { 
-      role: 'assistant', 
-      content: answer,
-      sources: sources 
-    }]);
+  const handleQueryResponse = (answer: string, sources: string[]) => {
+    // When we get the final response
+    if (streamingContent !== null) {
+      // Use the streamed content for the message
+      setMessages(prev => [...prev, { 
+        role: 'assistant', 
+        content: streamingContent,
+        sources: sources 
+      }]);
+    } else {
+      // Fallback for HTTP response
+      setMessages(prev => [...prev, { 
+        role: 'assistant', 
+        content: answer,
+        sources: sources 
+      }]);
+    }
     
-    // Clear streaming content
+    // Clear streaming content and loading state
     setStreamingContent(null);
     setIsLoading(false);
-    scrollToBottom();
+    
+    // Ensure we scroll to the bottom after adding the new message
+    setTimeout(scrollToBottom, 50);
   };
 
   const handlePdfUpload = useCallback((files: File[]) => {
@@ -107,9 +132,8 @@ export default function Home() {
             pdfs={pdfs}
             onPdfUpload={handlePdfUpload}
             onRemovePdf={removePdf}
-            onStreamStart={handleStreamStart}
+            onQueryResponse={handleQueryResponse}
             onStreamToken={handleStreamToken}
-            onStreamEnd={handleStreamEnd}
             conversationId={conversationId}
           />
         </div>
