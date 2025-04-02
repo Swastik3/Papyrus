@@ -188,6 +188,7 @@ const InputForm: React.FC<InputFormProps> = ({
         const formData = new FormData();
         formData.append('file', file);
         formData.append('uploadId', uploadId);
+        formData.append('conversationId', conversationId || '');
         formData.append('socketId', socketService.getSocketId() || '');
         
         // Send the file via HTTP POST

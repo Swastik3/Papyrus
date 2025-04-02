@@ -220,7 +220,7 @@ def prepare_pinecone_batch(chunks: list, embeddings: np.ndarray, file_id: str, f
         if conversation_id:
             metadata = {
                 'text': chunk,
-                # 'conversation_id': conversation_id,
+                'conversation_id': conversation_id,
                 'source': filename,
                 'chunk_id': i
             }
@@ -276,7 +276,7 @@ def upsert_to_pinecone(index, batch_data: list, batch_size: int = 100) -> None:
         logger.error(f"Error in upsert_to_pinecone: {str(e)}")
         raise
 
-def process_pdf_chunk(page_data, file_id, filename, conversation_id:str = None):
+def process_pdf_chunk(page_data, file_id, filename, conversation_id):
     """
     Process a chunk of PDF pages, create embeddings and upsert to Pinecone
     

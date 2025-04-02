@@ -59,7 +59,7 @@ const ChatMessages: React.FC<ChatMessagesProps> = ({
       ))}
       
       {/* Streaming content - more visible for debugging */}
-      {streamingContent !== null && (
+      {/* {streamingContent !== null && (
         <div className="flex justify-start">
           <div 
             className="bg-[#2d385b] rounded-lg py-3 px-5 max-w-[70%] relative" 
@@ -70,10 +70,10 @@ const ChatMessages: React.FC<ChatMessagesProps> = ({
             <div ref={streamingRef}></div>
           </div>
         </div>
-      )}
+      )} */}
       
       {/* Loading indicator (only shown if not streaming) */}
-      {isLoading && streamingContent === null && (
+      {isLoading && !streamingContent && (
         <div className="flex justify-start">
           <div className="bg-[#1A1A1A] rounded-lg p-4">
             <div className="flex space-x-2">

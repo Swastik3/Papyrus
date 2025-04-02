@@ -390,8 +390,7 @@ def generate_answer_with_context_and_history(
     model: str = DEFAULT_MODEL,
     conversation_id: Optional[str] = None,
     streaming: bool = False,
-    socket_emit_func = None,
-    filters: Optional[Dict[str, Any]] = None
+    socket_emit_func = None
 ) -> Dict[str, Any]:
     """
     Generate an answer to a user query using context from vector search and conversation history
@@ -425,6 +424,7 @@ def generate_answer_with_context_and_history(
             context_prompt = f"""You are answering a question generally.
                     {user_query}
                     """
+            has_context = False
         
         # Create prompt with context
         else: 
@@ -439,6 +439,7 @@ def generate_answer_with_context_and_history(
                     QUESTION:
                     {user_query}
                     """
+            has_context = True
         
         # Initialize OpenAI client
         client = OpenAI(api_key=os.getenv('OPENAI_API_KEY'))
@@ -510,7 +511,7 @@ def generate_answer_with_context_and_history(
         return {
             "answer": answer,
             "sources": sources,
-            "has_context": True,
+            "has_context": has_context,
             "processing_time": round(elapsed_time, 2)
         }
         

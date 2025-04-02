@@ -74,7 +74,7 @@ def cleanup_upload(upload_id):
         del active_uploads[upload_id]
     logger.info(f"Cleaned up upload: {upload_id}")
 
-def process_pdf_pages(file_bytes, upload_id, file_id, filename, sid):
+def process_pdf_pages(file_bytes, upload_id, file_id, filename, sid, conversation_id):
     """Process PDF pages and send progress updates via WebSocket"""
     try:
         from pypdf import PdfReader
@@ -137,7 +137,7 @@ def process_pdf_pages(file_bytes, upload_id, file_id, filename, sid):
         }, room=sid)
         
         # Process the chunks
-        chunks_processed = process_pdf_chunk(all_page_data, file_id, filename)
+        chunks_processed = process_pdf_chunk(all_page_data, file_id, filename, conversation_id)
         
         # Mark as completed
         active_uploads[upload_id]['completed'] = True
@@ -178,7 +178,8 @@ def upload_pdf():
             return jsonify({'success': False, 'error': 'No file provided'}), 400
             
         file = request.files['file']
-        
+        conversation_id = request.form.get('conversationId')
+        print(f"Conversation ID: {conversation_id}")
         # Check if filename is empty
         if file.filename == '':
             return jsonify({'success': False, 'error': 'No file selected'}), 400
@@ -212,7 +213,7 @@ def upload_pdf():
             file_bytes = f.read()
         
         # Process the PDF (non-threaded)
-        result_file_id = process_pdf_pages(file_bytes, upload_id, file_id, filename, sid)
+        result_file_id = process_pdf_pages(file_bytes, upload_id, file_id, filename, sid, conversation_id)
         
         if result_file_id:
             return jsonify({
