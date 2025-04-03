@@ -1,3 +1,6 @@
 backend/__pycache__/
 backend/uploads/
 backend/.env
+.env
+**/*.pdf
+archive/

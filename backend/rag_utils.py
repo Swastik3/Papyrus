@@ -218,6 +218,7 @@ def prepare_pinecone_batch(chunks: list, embeddings: np.ndarray, file_id: str, f
     batch_data = []
     for i, (chunk, embedding) in enumerate(zip(chunks, embeddings)):
         if conversation_id:
+            logger.info(f"conversation_id received for batching is: {conversation_id}")
             metadata = {
                 'text': chunk,
                 'conversation_id': conversation_id,
@@ -435,7 +436,7 @@ def get_relevant_context(user_query: str, conversation_id:str, threshold: float 
         filtered_results = filtered_results[:max_results]
         
         if not filtered_results:
-            logger.info(f"No relevant context found for query: {user_query}")
+            logger.info(f"No relevant context found for query: {user_query} for conversation_id: {conversation_id}")
             return "", []
         
         # Extract text and sources

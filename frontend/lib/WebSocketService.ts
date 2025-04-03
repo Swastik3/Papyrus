@@ -105,6 +105,18 @@ export class WebSocketService {
         this.emit('upload_progress', data);
       });
 
+      // Add listener for scan progress updates
+      this.socket.on('scan_progress', (data) => {
+        console.log('Scan progress received:', data);
+        this.emit('scan_progress', data);
+      });
+
+      // Add listener for scan completion
+      this.socket.on('scan_complete', (data) => {
+        console.log('Scan complete received:', data);
+        this.emit('scan_complete', data);
+      });
+
       // Simplified token handler - directly emit each token with debug logging
       this.socket.on('token', (data) => {
         console.log('Token Received: ', data);

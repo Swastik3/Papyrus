@@ -11,10 +11,18 @@ import logging
 from werkzeug.utils import secure_filename
 import json
 from dotenv import load_dotenv
+from queue import Queue
 # from gevent import monkey
 # monkey.patch_all()
 load_dotenv()
-
+from conversation import (
+    get_all_conversations_from_db,
+    get_conversation_messages,
+    generate_answer_with_context_and_history,
+    add_file_to_conversation,
+    get_conversation_files,
+    ConversationManager
+)
 # Import RAG utilities
 from rag_utils import (
     initialize_pinecone, 
@@ -27,10 +35,7 @@ from rag_utils import (
     EMBEDDING_DIMENSION
 )
 
-from conversation import (
-    get_all_conversations_from_db,
-    generate_answer_with_context_and_history
-)
+from thread_ocr import process_pdfs_with_ocr
 
 # Configure logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
@@ -214,7 +219,9 @@ def upload_pdf():
         
         # Process the PDF (non-threaded)
         result_file_id = process_pdf_pages(file_bytes, upload_id, file_id, filename, sid, conversation_id)
-        
+        # Update MongoDB document with the file information
+        if add_file_to_conversation(conversation_id, filename, unique_filename):
+            logger.info(f"Added file {filename} to conversation {conversation_id}")
         if result_file_id:
             return jsonify({
                 'success': True,
@@ -276,52 +283,7 @@ def search_pdf_content():
         logger.error(f"Error searching PDF content: {e}")
         return jsonify({'error': str(e)}), 500
 
-@app.route('/api/query', methods=['POST'])
-def query_pdf_content():
-    """
-    Query the system with a natural language question and get an answer
-    generated based on the indexed PDF content
-    """
-    try:
-        data = request.json
-        query = data.get('query')
-        model = data.get('model', 'gpt-4o-mini')
-        conversation_id = data.get('conversationId')
-        
-        if not query:
-            return jsonify({'error': 'No query provided'}), 400
-        
-        logger.info(f"Processing query: {query}")
-        
-        # Generate answer with context
-        start_time = time.time()
-        
-        # Use langchain if specified, otherwise use our standard RAG
-        # if conversation_id:
-        #     result = generate_answer_with_langchain(query, model=model, conversation_id=conversation_id)
-        # else:
-        result = generate_answer_with_context_and_history(query, model=model, 
-                                                          conversation_id=conversation_id)
-        
-        elapsed_time = time.time() - start_time
-        
-        # Add processing time to result
-        result['processing_time'] = round(elapsed_time, 2)
-        
-        logger.info(f"Query processed in {elapsed_time:.2f} seconds")
-        logger.info(f"Query result: {result}")
-        
-        return jsonify(result)
-        
-    except Exception as e:
-        logger.error(f"Error processing query: {e}")
-        return jsonify({
-            'error': str(e),
-            'answer': "I encountered an error while processing your question. Please try again.",
-            'sources': [],
-            'has_context': False
-        }), 500
-    
+
 @app.route('/api/conversations', methods=['POST'])
 def get_all_conversations():
     """
@@ -331,16 +293,63 @@ def get_all_conversations():
         data = request.json
         user_id = data.get('userId')
         
-        if not user_id:
-            return jsonify({'error': 'No user ID provided'}), 400
-        conversations_ids = get_all_conversations_from_db(user_id)
+        conversations = get_all_conversations_from_db(user_id)
         
         return jsonify({
-            'conversations_ids': conversations_ids
+            'conversations': conversations
         })
         
     except Exception as e:
         logger.error(f"Error fetching conversations: {e}")
+        return jsonify({'error': str(e)}), 500
+
+@app.route('/api/conversation-messages', methods=['POST'])
+def get_conversation_messages_endpoint():
+    """
+    Get all messages for a specific conversation
+    """
+    try:
+        data = request.json
+        conversation_id = data.get('conversationId')
+        
+        if not conversation_id:
+            return jsonify({'error': 'No conversation ID provided'}), 400
+            
+        result = get_conversation_messages(conversation_id)
+        
+        return jsonify(result)
+        
+    except Exception as e:
+        logger.error(f"Error fetching conversation messages: {e}")
+        return jsonify({'error': str(e)}), 500
+
+@app.route('/api/delete-conversation', methods=['POST'])
+def delete_conversation_endpoint():
+    """
+    Delete a specific conversation from the database
+    """
+    try:
+        data = request.json
+        conversation_id = data.get('conversationId')
+        
+        if not conversation_id:
+            return jsonify({'error': 'No conversation ID provided'}), 400
+        
+        # Initialize conversation manager if needed
+        conversation_manager = ConversationManager()
+        
+        # Delete the conversation
+        success = conversation_manager.delete_conversation(conversation_id)
+        
+        if success:
+            logger.info(f"Successfully deleted conversation {conversation_id}")
+            return jsonify({'success': True, 'message': 'Conversation deleted successfully'})
+        else:
+            logger.error(f"Failed to delete conversation {conversation_id}")
+            return jsonify({'success': False, 'error': 'Failed to delete conversation'}), 500
+            
+    except Exception as e:
+        logger.error(f"Error deleting conversation: {e}")
         return jsonify({'error': str(e)}), 500
 
 @socketio.on('query')
@@ -359,7 +368,7 @@ def handle_query(data):
             })
             return
         
-        logger.info(f"Processing streamed query: {query}")
+        logger.info(f"Processing streamed query: {query} with conversation_id: {conversation_id}")
         
         # Emit that we're processing the query
         emit('query_processing', {
@@ -398,6 +407,211 @@ def handle_query(data):
             'error': str(e)
         })
 
+@app.route('/api/citation-text', methods=['POST'])
+def get_citation_text():
+    """Get the text content for a specific citation"""
+    try:
+        data = request.json
+        citation_source = data.get('source')
+        conversation_id = data.get('conversationId')
+        # Not implemented yet 
+        return jsonify({'error': 'Invalid citation source format'}), 400
+        
+    except Exception as e:
+        logger.error(f"Error getting citation text: {e}")
+        return jsonify({'error': str(e)}), 500
+
+@app.route('/api/pdf/<filename>', methods=['GET'])
+def get_pdf_file(filename):
+    """
+    Get a specific PDF file by filename
+    """
+    try:
+        # Get conversation_id from the request if provided
+        conversation_id = request.args.get('conversation_id')
+        logger.info(f"Getting PDF file {filename} for conversation {conversation_id}")            
+        # Try to get the file information from MongoDB
+        pdf_path = None
+        
+        # First check if this is a file ID
+        unique_name = get_conversation_files(conversation_id).get(filename, None)
+        if unique_name:
+                pdf_path = os.path.join(UPLOAD_FOLDER, unique_name)
+        else:
+            logger.info(f"File {filename} not found in MongoDB")
+                    
+        if not pdf_path:
+            return jsonify({'error': 'PDF not found'}), 404
+            
+        # Return the PDF file
+        return send_from_directory(
+            os.path.dirname(pdf_path),
+            os.path.basename(pdf_path),
+            mimetype='application/pdf'
+        )
+        
+    except Exception as e:
+        logger.error(f"Error retrieving PDF file: {e}")
+        return jsonify({'error': str(e)}), 500
+
+# Replace the existing scan_pdf route with this implementation
+@app.route('/api/scan_pdf', methods=['POST'])
+def scan_pdf():
+    """Handle PDF OCR upload and processing with Pinecone indexing"""
+    try:
+        # Check if files are in the request
+        if 'scans' not in request.files:
+            return jsonify({'success': False, 'error': 'No files provided for OCR processing'}), 400
+            
+        files = request.files.getlist('scans')
+        conversation_id = request.form.get('conversationId')
+        socket_id = request.form.get('socketId')
+        
+        if not files or len(files) == 0:
+            return jsonify({'success': False, 'error': 'No files selected'}), 400
+            
+        logger.info(f"Received {len(files)} files for OCR processing in conversation {conversation_id}")
+        
+        # Process each file - only accept PDFs
+        valid_files = []
+        for file in files:
+            # Validate file is a PDF
+            if not file.filename or not file.filename.lower().endswith('.pdf'):
+                return jsonify({'success': False, 'error': 'Only PDF files are supported for OCR'}), 400
+                
+            # Generate file ID
+            file_id = str(uuid.uuid4())
+            
+            # Read file bytes and add to processing list
+            file_bytes = file.read()
+            valid_files.append((file.filename, file_bytes, file_id))
+            
+            # Save the uploaded file
+            secure_name = secure_filename(file.filename)
+            unique_filename = f"{file_id}_{secure_name}"
+            file_path = os.path.join(UPLOAD_FOLDER, unique_filename)
+            
+            # Save the file to disk
+            with open(file_path, 'wb') as f:
+                f.write(file_bytes)
+                
+            # Add file to the conversation
+            if add_file_to_conversation(conversation_id, file.filename, unique_filename):
+                logger.info(f"Added OCR PDF {file.filename} to conversation {conversation_id}")
+        
+        # Generate a unique ID for this OCR batch
+        ocr_batch_id = str(uuid.uuid4())
+        
+        # Create directory for OCR results if it doesn't exist
+        ocr_results_dir = os.path.join(UPLOAD_FOLDER, 'ocr_results')
+        if not os.path.exists(ocr_results_dir):
+            os.makedirs(ocr_results_dir)
+        
+        result_queue = Queue()
+        
+        # Modify the thread function to use a queue for communication
+        def process_ocr_files_thread():
+            try:
+                # Process all files without intermediate progress updates
+                ocr_results = process_pdfs_with_ocr(
+                    valid_files, 
+                    process_pdf_chunk,
+                    conversation_id,
+                    max_workers=4,
+                )
+                
+                # Save OCR results to text files
+                for filename, text in ocr_results.items():
+                    if text:
+                        # Save extracted text to a file
+                        safe_filename = secure_filename(filename)
+                        text_filename = f"{ocr_batch_id}_{safe_filename}.txt"
+                        text_path = os.path.join(ocr_results_dir, text_filename)
+                        
+                        with open(text_path, 'w', encoding='utf-8') as f:
+                            f.write(text)
+                            
+                        logger.info(f"Saved OCR text for {filename} to {text_path}")
+                
+                # Put success result in queue
+                result_queue.put({
+                    'success': True,
+                    'fileId': ocr_batch_id,
+                    'totalFiles': len(files)
+                })
+                
+            except Exception as e:
+                # Put error result in queue
+                logger.error(f"Error in OCR processing thread: {str(e)}")
+                result_queue.put({
+                    'success': False,
+                    'error': str(e),
+                    'fileId': ocr_batch_id
+                })
+        
+        # Start OCR processing in a background thread
+        ocr_thread = threading.Thread(target=process_ocr_files_thread)
+        ocr_thread.start()  # Remove daemon=True
+        
+        # Wait for the thread to complete and get results
+        ocr_thread.join(timeout=300)  # 5-minute timeout
+        
+        # Retrieve results from the queue
+        try:
+            result = result_queue.get(block=False)
+            
+            # Use socketio.emit with namespace if needed
+            if socket_id:
+                if result.get('success'):
+                    # Emit progress update
+                    socketio.emit('scan_progress', {
+                        'id': f"ocr-{result['fileId']}",
+                        'fileId': result['fileId'],
+                        'fileName': f"OCR Documents ({result['totalFiles']})",
+                        'progress': 100,
+                        'status': 'completed',
+                        'message': 'OCR processing completed successfully',
+                        'totalPages': len(valid_files),
+                        'processedPages': len(valid_files)
+                    }, room=socket_id)
+                    
+                    # Emit completion event
+                    socketio.emit('scan_complete', {
+                        'success': True,
+                        'fileId': result['fileId'],
+                        'message': 'OCR processing completed successfully'
+                    }, room=socket_id)
+                else:
+                    # Emit error event
+                    socketio.emit('scan_progress', {
+                        'id': f"ocr-{result['fileId']}",
+                        'fileId': result['fileId'],
+                        'fileName': f"OCR Documents ({len(files)})",
+                        'progress': 0,
+                        'status': 'error',
+                        'error': f'OCR processing failed: {result.get("error", "Unknown error")}'
+                    }, room=socket_id)
+            
+            # Return appropriate response
+            return jsonify({
+                'success': result.get('success', False),
+                'fileId': result.get('fileId'),
+                'message': 'OCR processing completed.'
+            })
+        
+        except result_queue.Empty:
+            # Thread did not complete in time
+            logger.error("OCR processing thread timed out")
+            return jsonify({
+                'success': False, 
+                'error': 'OCR processing timed out'
+            }), 500
+        
+    except Exception as e:
+        logger.error(f"Error processing OCR documents: {str(e)}")
+        return jsonify({'success': False, 'error': str(e)}), 500
+
+    
 if __name__ == '__main__':
     # Initialize Pinecone
     initialize_pinecone()

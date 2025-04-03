@@ -384,6 +384,54 @@ class ConversationManager:
         except Exception as e:
             logger.error(f"Error updating conversation metadata in MongoDB: {e}")
             return False
+        
+    def add_file_to_conversation(self, conversation_id: str, filename: str, unique_filename: str):
+        """
+        Add a file to a specific conversation
+        
+        Args:
+            conversation_id: ID of the conversation to add the file to
+        """
+        try:
+            collection = self.collection
+            doc = collection.find_one({"conversation_id": conversation_id})
+            if doc and "files" in doc:
+                # If files exists, add the new key-value pair to the existing dictionary
+                existing_files = doc.get("files", {})
+                existing_files[filename] = unique_filename
+                metadata_update = {"files": existing_files}
+            else:
+                # If files doesn't exist, create a new dictionary with the key-value pair
+                metadata_update = {"files": {filename: unique_filename}}
+                
+            # Update the database with the new file information
+            result = collection.update_one(
+                {"conversation_id": conversation_id},
+                {"$set": {
+                    "files": metadata_update["files"],
+                    "last_updated": datetime.utcnow()
+                }},
+                upsert=True
+            )
+            
+            logger.info(f"Added file {filename} to conversation {conversation_id}")
+            return True
+        except Exception as e:
+            logger.error(f"Error adding file to conversation {conversation_id}: {e}")
+            return False
+        
+    def get_conversation_files(self, conversation_id: str):
+        """
+        Get the files for a specific conversation
+        """
+        try:
+            collection = self.collection
+            doc = collection.find_one({"conversation_id": conversation_id})
+            return doc.get("files", {})
+        except Exception as e:
+            logger.error(f"Error getting files for conversation {conversation_id}: {e}")
+            return {}
+    
 
 def generate_answer_with_context_and_history(
     user_query: str, 
@@ -559,19 +607,98 @@ def clear_conversation(conversation_id: str) -> bool:
 conversation_manager = ConversationManager()
 
 # wrapper for get_all_conversations
-def get_all_conversations_from_db() -> List[str]:
+def get_all_conversations_from_db(user_id=None):
     """
-    Get all conversation IDs from MongoDB
+    Get all conversation IDs from MongoDB with their first user message
     
+    Args:
+        user_id: Optional user ID to filter conversations
+        
     Returns:
-        List of conversation IDs
+        List of dictionaries with conversation IDs and first messages
     """
     try:
-        return conversation_manager.get_all_conversations()
+        global conversation_manager
+        if conversation_manager is None:
+            conversation_manager = ConversationManager()
+            
+        # Get all conversation IDs
+        conversation_ids = conversation_manager.get_conversation_ids()
+        
+        # Get the first user message for each conversation
+        conversations_with_preview = []
+        
+        for conv_id in conversation_ids:
+            messages = conversation_manager.get_conversation(conv_id)
+            
+            # Find the first user message
+            first_user_message = None
+            for msg in messages:
+                if msg.get('role') == 'user':
+                    first_user_message = msg.get('content')
+                    # Truncate long messages
+                    if first_user_message and len(first_user_message) > 50:
+                        first_user_message = first_user_message[:50] + '...'
+                    break
+                    
+            conversations_with_preview.append({
+                "conversation_id": conv_id,
+                "first_message": first_user_message or "New conversation",
+                "message_count": len([m for m in messages if m.get('role') != 'system'])
+            })
+            
+        logger.info(f"Retrieved {len(conversations_with_preview)} conversations with previews")
+        return conversations_with_preview
+        
     except Exception as e:
         logger.error(f"Error retrieving conversations from MongoDB: {e}")
         return []
+    
+    
+def get_conversation_messages(conversation_id: str):
+    """
+    Get all messages for a specific conversation
+    
+    Args:
+        conversation_id: ID of the conversation to retrieve
+        
+    Returns:
+        Dict containing the messages and conversation metadata
+    """
+    try:
+        # Get the conversation manager
+        global conversation_manager
+        if conversation_manager is None:
+            conversation_manager = ConversationManager()
+            
+        # Retrieve messages for the specified conversation
+        messages = conversation_manager.get_conversation(conversation_id)
+        
+        # Get metadata
+        metadata = conversation_manager.get_conversation_metadata(conversation_id)
+        
+        logger.info(f"Retrieved {len(messages)} messages for conversation {conversation_id}")
+        
+        return {
+            "conversation_id": conversation_id,
+            "messages": messages,
+            "metadata": metadata
+        }
+        
+    except Exception as e:
+        logger.error(f"Error retrieving conversation messages: {e}")
+        return {
+            "conversation_id": conversation_id,
+            "messages": [],
+            "metadata": {},
+            "error": str(e)
+        }
+    
+def add_file_to_conversation(conversation_id: str, filename: str, unique_filename: str):
+    return conversation_manager.add_file_to_conversation(conversation_id, filename, unique_filename)
 
+def get_conversation_files(conversation_id: str,):
+    return conversation_manager.get_conversation_files(conversation_id)
 
 # Example Flask API routes (commented out for reference):
 """
