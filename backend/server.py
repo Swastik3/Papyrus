@@ -5,13 +5,18 @@ from flask_socketio import SocketIO, emit
 import os
 import base64
 import uuid
-import time
 import threading
 import logging
 from werkzeug.utils import secure_filename
 import json
 from dotenv import load_dotenv
 from queue import Queue
+import io
+import fitz  # PyMuPDF
+import pandas as pd
+import time
+from pypdf import PdfReader
+import io
 # from gevent import monkey
 # monkey.patch_all()
 load_dotenv()
@@ -30,12 +35,14 @@ from rag_utils import (
     process_pdf_chunk,
     search_pinecone,
     get_relevant_context,
-    # generate_answer_with_context,
+    process_smart_content,
     PINECONE_INDEX_NAME,
     EMBEDDING_DIMENSION
 )
 
 from thread_ocr import process_pdfs_with_ocr
+from gmft.auto import AutoTableDetector, AutoTableFormatter
+from gmft_pymupdf import PyMuPDFDocument
 
 # Configure logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
@@ -82,8 +89,7 @@ def cleanup_upload(upload_id):
 def process_pdf_pages(file_bytes, upload_id, file_id, filename, sid, conversation_id):
     """Process PDF pages and send progress updates via WebSocket"""
     try:
-        from pypdf import PdfReader
-        import io
+       
         
         # Read the PDF
         pdf_stream = io.BytesIO(file_bytes)
@@ -174,7 +180,7 @@ def process_pdf_pages(file_bytes, upload_id, file_id, filename, sid, conversatio
         }, room=sid)
         return None
 
-@app.route('/api/upload-pdf', methods=['POST'])
+@app.route('/api/upload-pdf-new', methods=['POST'])
 def upload_pdf():
     """Handle PDF upload via HTTP POST"""
     try:
@@ -611,6 +617,270 @@ def scan_pdf():
         logger.error(f"Error processing OCR documents: {str(e)}")
         return jsonify({'success': False, 'error': str(e)}), 500
 
+def process_pdf_pages_smart(file_bytes, upload_id, file_id, filename, sid, conversation_id):
+    """Process PDF pages with smart chunking and send progress updates via WebSocket"""
+    try:
+        detector = AutoTableDetector()
+        formatter = AutoTableFormatter()
+
+        pdf_stream = io.BytesIO(file_bytes)
+        doc = fitz.open(stream=pdf_stream, filetype="pdf")
+        total_pages = len(doc)
+        
+        # Initialize upload info
+        active_uploads[upload_id] = {
+            'filename': filename,
+            'file_id': file_id,
+            'start_time': time.time(),
+            'sid': sid,
+            'total_pages': total_pages,
+            'processed_pages': 0,
+            'completed': False
+        }
+        
+        # Save file to disk temporarily for PyMuPDFDocument to work
+        temp_file_path = os.path.join(UPLOAD_FOLDER, f"temp_{file_id}.pdf")
+        with open(temp_file_path, 'wb') as f:
+            f.write(file_bytes)
+        
+        # Extract content from pages
+        all_content_data = []
+        
+        for page_idx in range(total_pages):
+            # Update processed pages
+            active_uploads[upload_id]['processed_pages'] = page_idx + 1
+            
+            # Calculate progress percentage
+            progress = int(((page_idx + 1) / total_pages) * 100)
+            
+            # Emit progress update
+            socketio.emit('upload_progress', {
+                'id': upload_id,
+                'fileId': file_id,
+                'fileName': filename,
+                'progress': progress,
+                'status': 'uploading',
+                'message': f'Processing page {page_idx + 1}/{total_pages}',
+                'processedPages': page_idx + 1,
+                'totalPages': total_pages
+            }, room=sid)
+            
+            page = doc[page_idx]
+            page_num = page_idx + 1  # 1-indexed for user-friendliness
+            
+            # Process the page and extract content
+            page_content = process_pdf_page(page, page_num, temp_file_path, detector, formatter)
+            all_content_data.extend(page_content)
+        
+        # Close the document
+        doc.close()
+                # Remove temporary file
+        if os.path.exists(temp_file_path):
+            os.remove(temp_file_path)
+        
+        # Process all content at once
+        socketio.emit('upload_progress', {
+            'id': upload_id,
+            'fileId': file_id,
+            'fileName': filename,
+            'progress': 80,
+            'status': 'uploading',
+            'message': f'Processing extracted content...',
+            'processedPages': total_pages,
+            'totalPages': total_pages
+        }, room=sid)
+        
+        # Process the content using our smart chunking strategy
+        chunks_processed = process_smart_content(all_content_data, file_id, filename, conversation_id)
+        
+        # Mark as completed
+        active_uploads[upload_id]['completed'] = True
+        
+        # Final update
+        socketio.emit('upload_progress', {
+            'id': upload_id,
+            'fileId': file_id,
+            'fileName': filename,
+            'progress': 100,
+            'status': 'completed',
+            'message': f'PDF processed and indexed successfully',
+            'processedPages': total_pages,
+            'totalPages': total_pages
+        }, room=sid)
+        
+        logger.info(f"Completed processing PDF {filename} with {chunks_processed} chunks")
+        return file_id
+        
+    except Exception as e:
+        logger.error(f"Error processing PDF with smart chunking: {str(e)}")
+        socketio.emit('upload_progress', {
+            'id': upload_id,
+            'fileId': file_id,
+            'fileName': filename,
+            'progress': 0,
+            'status': 'error',
+            'error': f'Error processing PDF: {str(e)}'
+        }, room=sid)
+        return None
+            
+def process_pdf_page(page, page_num, temp_file_path, detector, formatter):
+    """
+    Process a single PDF page to extract text and tables.
+    
+    Args:
+        page: The PyMuPDF page object
+        page_num: The page number (1-indexed)
+        temp_file_path: Path to the temporary PDF file
+        detector: The AutoTableDetector instance
+        formatter: The AutoTableFormatter instance
+        
+    Returns:
+        list: List of content data dictionaries for the page
+    """
+    page_content = []
+    
+    # Get PyMuPDFDocument page for table detection
+    try:
+        pymupdf_page = PyMuPDFDocument(temp_file_path)[page_num - 1]
+        
+        # Detect tables on the page
+        page_tables = detector.extract(pymupdf_page)
+        
+        if page_tables:
+            # Process each table on the page
+            for table_idx, table in enumerate(page_tables):
+                try:
+                    # Format the table
+                    formatted_table = formatter.format(table)
+                    table_df = formatted_table.df()
+                    
+                    # Get page text for context
+                    page_text = page.get_text()
+                    text_parts = page_text.split('\n')
+                    split_index = len(text_parts) // 2  # Rough midpoint
+                    pre_table_text = '\n'.join(text_parts[:split_index])
+                    post_table_text = '\n'.join(text_parts[split_index:])
+                    
+                    # Convert table to markdown
+                    table_markdown = table_df.to_markdown(index=True)
+                    
+                    # Compile the table content with context
+                    table_content = (
+                        f"Context Before Table:\n{pre_table_text}\n\n"
+                        f"Table {table_idx + 1} on Page {page_num}:\n"
+                        f"{table_markdown}\n\n"
+                        f"Context After Table:\n{post_table_text}"
+                    )
+                    
+                    # Add to content data
+                    page_content.append({
+                        'pageNum': page_num,
+                        'text': table_content,
+                        'is_table': True,
+                        'table_index': table_idx
+                    })
+                    
+                except Exception as e:
+                    logger.error(f"Error processing table on page {page_num}: {str(e)}")
+                    # If table processing fails, fall back to text extraction
+                    page_text = page.get_text()
+                    page_content.append({
+                        'pageNum': page_num,
+                        'text': page_text,
+                        'is_table': False
+                    })
+        
+        else:
+            # No tables found, extract and chunk text
+            page_text = page.get_text()
+            page_content.append({
+                'pageNum': page_num,
+                'text': page_text,
+                'is_table': False
+            })
+            
+    except Exception as e:
+        logger.error(f"Error in table detection for page {page_num}: {str(e)}")
+        # Fall back to text extraction on error
+        page_text = page.get_text()
+        page_content.append({
+            'pageNum': page_num,
+            'text': page_text,
+            'is_table': False
+        })
+    
+    return page_content
+        
+
+
+@app.route('/api/upload-pdf', methods=['POST'])
+def upload_pdf_new():
+    """Handle PDF upload via HTTP POST with smart chunking"""
+    try:
+        # Check if file is in the request
+        if 'file' not in request.files:
+            return jsonify({'success': False, 'error': 'No file provided'}), 400
+            
+        file = request.files['file']
+        conversation_id = request.form.get('conversationId')
+        print(f"Conversation ID: {conversation_id}")
+        
+        # Check if filename is empty
+        if file.filename == '':
+            return jsonify({'success': False, 'error': 'No file selected'}), 400
+            
+        # Check if file is a PDF
+        if not file.filename.lower().endswith('.pdf'):
+            return jsonify({'success': False, 'error': 'File must be a PDF'}), 400
+        
+        # Get upload ID from form or generate one
+        upload_id = request.form.get('uploadId', f"upload-{uuid.uuid4()}")
+        
+        # Generate a unique filename
+        file_id = str(uuid.uuid4())
+        filename = file.filename
+        secure_name = secure_filename(filename)
+        unique_filename = f"{file_id}_{secure_name}"
+        file_path = os.path.join(UPLOAD_FOLDER, unique_filename)
+        
+        # Save file to disk
+        file.save(file_path)
+        logger.info(f"File saved to {file_path}")
+        
+        # Get client's socket ID
+        sid = request.form.get('socketId')
+        if not sid:
+            # Get client connections for this session
+            return jsonify({'success': False, 'error': 'Socket ID required for progress updates'}), 400
+        
+        # Read the file into memory
+        with open(file_path, 'rb') as f:
+            file_bytes = f.read()
+        
+        # Process the PDF with smart chunking
+        result_file_id = process_pdf_pages_smart(file_bytes, upload_id, file_id, filename, sid, conversation_id)
+        
+        # Update MongoDB document with the file information
+        if add_file_to_conversation(conversation_id, filename, unique_filename):
+            logger.info(f"Added file {filename} to conversation {conversation_id}")
+            
+        if result_file_id:
+            return jsonify({
+                'success': True,
+                'fileId': file_id,
+                'filename': filename,
+                'message': 'File processed successfully using smart chunking'
+            })
+        else:
+            return jsonify({
+                'success': False,
+                'error': 'Failed to process PDF with smart chunking'
+            }), 500
+        
+    except Exception as e:
+        logger.error(f"Error in upload_pdf_new: {str(e)}")
+        return jsonify({'success': False, 'error': str(e)}), 500
+    
     
 if __name__ == '__main__':
     # Initialize Pinecone

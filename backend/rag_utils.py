@@ -603,7 +603,108 @@ def delete_all_embeddings_from_index(index_name: str = PINECONE_INDEX_NAME):
     except Exception as e:
         logger.error(f"Error deleting vectors from index: {e}")
         return False
+
+
+
+def process_smart_content(content_data, file_id, filename, conversation_id):
+    """
+    Process content data using smart chunking strategy
     
+    Args:
+        content_data: List of dictionaries with 'pageNum', 'text', and 'is_table' keys
+        file_id: Unique identifier for the file
+        filename: Name of the file
+        conversation_id: ID of the conversation
+    
+    Returns:
+        Number of chunks processed
+    """
+    try:
+        # Separate table content and text content
+        table_content = [item for item in content_data if item.get('is_table', False)]
+        text_content = [item for item in content_data if not item.get('is_table', False)]
+        
+        # Process table content first (tables are already their own chunks)
+        table_chunks = [item['text'] for item in table_content]
+        table_page_numbers = [item['pageNum'] for item in table_content]
+        
+        # Process text content with standard chunking
+        text_pages = []
+        page_numbers = []
+        
+        for item in text_content:
+            text_pages.append(item['text'])
+            page_numbers.append(item['pageNum'])
+        
+        # Combine all text into one string
+        combined_text = ' '.join(text_pages)
+        
+        # Chunk the text
+        CHUNK_SIZE = 1000
+        CHUNK_OVERLAP = 200
+        text_chunks = chunk_text(combined_text, CHUNK_SIZE, CHUNK_OVERLAP)
+        
+        # Combine table chunks and text chunks
+        all_chunks = table_chunks + text_chunks
+        
+        # If no chunks were created, return 0
+        if not all_chunks:
+            logger.warning(f"No chunks created for {filename}")
+            return 0
+        
+        # Create embeddings
+        embeddings = create_embeddings(all_chunks)
+        
+        # Map table chunks directly to their page numbers
+        # For text chunks, approximate the page mapping
+        chunk_page_numbers = []
+        
+        # Add table page numbers first
+        chunk_page_numbers.extend(table_page_numbers)
+        
+        # Map text chunks to approximate page numbers
+        text_processed = 0
+        current_page_idx = 0
+        
+        if text_pages and page_numbers:  # Only if we have text content
+            current_page_text = text_pages[current_page_idx]
+            current_page_length = len(current_page_text)
+            current_page_number = page_numbers[current_page_idx]
+            
+            for chunk in text_chunks:
+                chunk_length = len(chunk)
+                
+                # If this chunk would exceed the current page, move to the next page
+                while current_page_idx < len(text_pages) - 1 and text_processed + chunk_length > current_page_length:
+                    text_processed = 0
+                    current_page_idx += 1
+                    current_page_text = text_pages[current_page_idx]
+                    current_page_length = len(current_page_text)
+                    current_page_number = page_numbers[current_page_idx]
+                
+                # Assign the current page number to this chunk
+                chunk_page_numbers.append(current_page_number)
+                
+                # Update text processed
+                text_processed += chunk_length
+        
+        # Get or create Pinecone index
+        index = create_or_get_index(PINECONE_INDEX_NAME, EMBEDDING_DIMENSION)
+        
+        # Prepare batch data
+        batch_data = prepare_pinecone_batch(all_chunks, embeddings, file_id, filename, 
+                                           conversation_id=conversation_id,
+                                           page_numbers=chunk_page_numbers)
+        
+        upsert_to_pinecone(index, batch_data)
+        
+        logger.info(f"Processed {len(all_chunks)} chunks ({len(table_chunks)} table chunks, {len(text_chunks)} text chunks) from {filename}")
+        return len(all_chunks)
+        
+    except Exception as e:
+        logger.error(f"Error in process_smart_content: {str(e)}")
+        raise
+
 if __name__ == "__main__":
     # Initialize Pinecone
     initialize_pinecone()

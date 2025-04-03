@@ -1,3 +1,4 @@
+# smart_chunks.py
 import time
 from gmft.auto import CroppedTable, TableDetector, AutoTableFormatter, AutoTableDetector
 from gmft.pdf_bindings import PyPDFium2Document
