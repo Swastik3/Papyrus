@@ -22,7 +22,7 @@ interface InputFormProps {
   pdfs: File[];
   onPdfUpload: (files: File[]) => void;
   onRemovePdf: (index: number) => void;
-  onQueryResponse: (answer: string, sources: string[]) => void;
+  onQueryResponse: (answer: string, sources: string[], structured_data?: any) => void;
   onStreamToken: (token: string) => void;
   conversationId: string;
 }
@@ -151,8 +151,15 @@ const InputForm: React.FC<InputFormProps> = ({
 
     const unsubQueryResult = socketService.on("query_result", (data) => {
       setIsQueryInProgress(false);
+      console.log("Query result received with structured data:", data);
+
       if (data && data.answer) {
-        onQueryResponse(data.answer, data.sources || []);
+        // Pass structured_data to onQueryResponse if available
+        onQueryResponse(
+          data.answer, 
+          data.sources || [], 
+          data.structured_data || []
+        );
       }
     });
 
@@ -193,10 +200,10 @@ const InputForm: React.FC<InputFormProps> = ({
     };
   }, [onQueryResponse, onStreamToken]);
 
-  // Keep track of which PDFs have been seen before
+  // Keep track of which PDFs have been processed
   const [processedPdfs, setProcessedPdfs] = useState<Set<string>>(new Set());
 
-  // Auto-upload new PDFs when they're added but not when removed
+  // Modified auto-upload effect to only upload new PDFs
   useEffect(() => {
     if (pdfs.length === 0) {
       // Reset processed PDFs when all are removed
@@ -204,22 +211,31 @@ const InputForm: React.FC<InputFormProps> = ({
       return;
     }
 
-    // Check if there are any new PDFs we haven't seen before
+    // If already uploading, don't start new uploads
+    if (isUploading) return;
+
+    // Check which PDFs are new and need uploading
     const pdfSignatures = pdfs.map(
       (pdf) => `${pdf.name}-${pdf.size}-${pdf.lastModified}`
     );
-    const newPdfsExist = pdfSignatures.some((sig) => !processedPdfs.has(sig));
+    
+    // Filter to only get new PDFs that haven't been processed yet
+    const newPdfs = pdfs.filter((pdf, index) => {
+      const signature = pdfSignatures[index];
+      return !processedPdfs.has(signature);
+    });
 
-    if (newPdfsExist && !isUploading) {
+    // Only upload if we have new PDFs
+    if (newPdfs.length > 0) {
       // Mark all current PDFs as processed
       const updatedProcessed = new Set(processedPdfs);
       pdfSignatures.forEach((sig) => updatedProcessed.add(sig));
       setProcessedPdfs(updatedProcessed);
 
-      // Start upload for all PDFs
-      uploadPdfs();
+      // Upload only the new PDFs
+      uploadSelectedPdfs(newPdfs);
     }
-  }, [pdfs, isUploading]); // eslint-disable-line react-hooks/exhaustive-deps
+  }, [pdfs]); // Remove isUploading from dependencies to prevent loop
 
   // Auto-size textarea
   useEffect(() => {
@@ -264,9 +280,9 @@ const InputForm: React.FC<InputFormProps> = ({
     return Math.round(total / uploadProgress.length);
   }, [uploadProgress]);
 
-  // Upload PDF files to server
-  const uploadPdfs = async () => {
-    if (pdfs.length === 0 || isUploading) return;
+  // Upload selected PDF files to server
+  const uploadSelectedPdfs = async (filesToUpload: File[]) => {
+    if (filesToUpload.length === 0 || isUploading) return;
 
     setIsUploading(true);
     const socketId = socketService.getSocketId();
@@ -278,7 +294,7 @@ const InputForm: React.FC<InputFormProps> = ({
     }
 
     // Create an array of upload promises to execute in parallel
-    const uploadPromises = pdfs.map(async (file, index) => {
+    const uploadPromises = filesToUpload.map(async (file, index) => {
       const uploadId = `upload-${Date.now()}-${index}`;
 
       try {
@@ -316,8 +332,8 @@ const InputForm: React.FC<InputFormProps> = ({
         const result = await response.json();
         if (result.success && result.fileId) {
           setUploadedPdfIds((prev) => {
-            const newSet = new Set([...prev, result.fileId]);
-            return Array.from(newSet);
+            const updatedSet = new Set([...prev, result.fileId]);
+            return Array.from(updatedSet);
           });
         }
 
@@ -469,7 +485,6 @@ const InputForm: React.FC<InputFormProps> = ({
 
   return (
     <div className="mt-auto">
-      {/* OCR Scan Progress Display */}
       {/* OCR Scan Progress Display */}
       {scanProgress && (
         <div className="mb-4 border border-gray-700 rounded-lg p-3 bg-gray-800">

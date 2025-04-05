@@ -27,7 +27,7 @@ EMBEDDING_DIMENSION = 1536  # For OpenAI's text-embedding-3-small
 CHUNK_SIZE = 1000
 CHUNK_OVERLAP = 200
 BATCH_SIZE = 100
-SIMILARITY_THRESHOLD = 0.0  # Minimum similarity score to consider a chunk relevant
+SIMILARITY_THRESHOLD = -1.00  # Minimum similarity score to consider a chunk relevant
 
 # Global Pinecone client
 pc = None 
@@ -285,6 +285,7 @@ def process_pdf_chunk(page_data, file_id, filename, conversation_id):
         page_data: List of dictionaries with 'pageNum' and 'text' keys
         file_id: Unique identifier for the file
         filename: Name of the file
+        conversation_id: ID of the conversation
     
     Returns:
         Number of chunks processed
@@ -294,7 +295,7 @@ def process_pdf_chunk(page_data, file_id, filename, conversation_id):
         page_texts = [page['text'] for page in page_data]
         page_numbers = [page['pageNum'] for page in page_data]
         
-        # Combine all texts into one string
+        # Combine all texts into one string with page markers
         combined_text = ' '.join(page_texts)
         
         # Chunk the text
@@ -307,37 +308,47 @@ def process_pdf_chunk(page_data, file_id, filename, conversation_id):
         # Create embeddings
         embeddings = create_embeddings(chunks)
         
-        # Map chunks to their approximate page numbers
-        # This is a simplified approach that assumes chunks come from sequential pages
+        # Map chunks to their approximate page numbers based on starting position
         chunk_page_numbers = []
-        text_processed = 0
-        current_page_idx = 0
-        current_page_text = page_texts[current_page_idx]
-        current_page_length = len(current_page_text)
         
+        # Calculate cumulative text lengths for page boundary detection
+        cumulative_lengths = [0]  # Start with 0
+        current_length = 0
+        for text in page_texts:
+            current_length += len(text)
+            cumulative_lengths.append(current_length)
+        
+        # For each chunk, determine which page it starts on
         for chunk in chunks:
-            chunk_length = len(chunk)
+            # Calculate where this chunk starts in the combined text
+            chunk_start_pos = combined_text.find(chunk[:50])  # Use first 50 chars to find reliable match
             
-            # If this chunk would exceed the current page, move to the next page
-            while text_processed + chunk_length > current_page_length and current_page_idx < len(page_texts) - 1:
-                text_processed = 0
-                current_page_idx += 1
-                current_page_text = page_texts[current_page_idx]
-                current_page_length = len(current_page_text)
+            # If match not found, use a different approach
+            if chunk_start_pos == -1:
+                logger.warning(f"Could not find exact chunk position. Using approximate mapping.")
+                # Just place in middle if we can't find it
+                chunk_start_pos = current_length // 2
             
-            # Assign the current page number to this chunk
-            chunk_page_numbers.append(page_numbers[current_page_idx])
-            
-            # Update text processed
-            text_processed += chunk_length
-        
+            # Find which page this position corresponds to
+            page_idx = 0
+            while page_idx < len(cumulative_lengths) - 1 and chunk_start_pos >= cumulative_lengths[page_idx + 1]:
+                page_idx += 1
+                
+            # Assign the page number
+            if page_idx < len(page_numbers):
+                chunk_page_numbers.append(page_numbers[page_idx])
+            else:
+                # Fallback to last page if something went wrong
+                chunk_page_numbers.append(page_numbers[-1])
+                logger.warning(f"Page mapping issue - assigned to last page")
+                
         # Get or create Pinecone index
         index = create_or_get_index(PINECONE_INDEX_NAME, EMBEDDING_DIMENSION)
         
         # Prepare batch data
         batch_data = prepare_pinecone_batch(chunks, embeddings, file_id, filename, 
-                                             conversation_id = conversation_id,
-                                             page_numbers=chunk_page_numbers)
+                                           conversation_id=conversation_id,
+                                           page_numbers=chunk_page_numbers)
         
         # Upsert to Pinecone
         upsert_to_pinecone(index, batch_data)
@@ -433,7 +444,7 @@ def get_relevant_context(user_query: str, conversation_id:str, threshold: float 
         filtered_results = [result for result in search_results if result['score'] >= threshold]
         
         # Limit to max_results
-        filtered_results = filtered_results[:max_results]
+        filtered_results = filtered_results[:max_results*2]
         
         if not filtered_results:
             logger.info(f"No relevant context found for query: {user_query} for conversation_id: {conversation_id}")
@@ -441,94 +452,41 @@ def get_relevant_context(user_query: str, conversation_id:str, threshold: float 
         
         # Extract text and sources
         context_chunks = []
-        sources = []
+        sources = [] #dict with source and page number
         
         for result in filtered_results:
             chunk_text = result['text']
             source = result['source']
             
+            # Create a dictionary with text and source information
+            chunk_dict = {
+                "text": chunk_text,
+                "source": source
+            }
+            
             # Add page number if available
             if 'page' in result:
                 source_with_page = f"{source} (page {result['page']})"
                 sources.append(source_with_page)
-                context_chunks.append(f"[{source_with_page}]\n{chunk_text}")
+                chunk_dict["page"] = result['page']
             else:
                 sources.append(source)
-                context_chunks.append(f"[{source}]\n{chunk_text}")
+            
+            # Append the dictionary to context_chunks
+            context_chunks.append(chunk_dict)
         
         # Get unique sources
-        sources = list(set(sources))
+        sources = list(set(sources)) #will be empty now
         
         # Join context chunks with separator
-        context_text = "\n\n---\n\n".join(context_chunks)
+        # context_text = "\n\n---\n\n".join(context_chunks)
         
-        logger.info(f"Found {len(filtered_results)} relevant chunks from {len(sources)} sources")
-        logger.info(f"Context text: {context_text[:100]}...")  # Log first 100 chars of context
-        return context_text, sources
+        # logger.info(f"Found {len(filtered_results)} relevant chunks from {len(sources)} sources")
+        # logger.info(f"Context text: {context_text[:100]}...")  # Log first 100 chars of context
+        return context_chunks, sources
         
     except Exception as e:
         logger.error(f"Error getting relevant context: {e}")
-        raise
-
-def generate_answer_with_context(user_query: str, model: str = "gpt-4o-mini") -> dict:
-    """
-    Generate an answer to a user query using context from the vector database.
-    
-    Args:
-        user_query: The user's question
-        model: The OpenAI model to use for generating the answer
-        
-    Returns:
-        Dictionary containing the answer, sources, and whether relevant context was found
-    """
-    try:
-        # Get relevant context
-        context, sources = get_relevant_context(user_query)
-        
-        # If no relevant context found
-        if not context:
-            return {
-                "answer": "I couldn't find relevant information in the uploaded documents to answer your question.",
-                "sources": [],
-                "has_context": False
-            }
-        
-        # Create prompt with context
-        prompt = f"""You are a helpful assistant that answers questions based on the provided context.
-                    Answer the question based ONLY on the context provided.
-                    If the context doesn't contain the information needed to answer the question, say "I don't have enough information to answer that question."
-                    Do not use any prior knowledge.
-
-                    CONTEXT:
-                    {context}
-
-                    QUESTION:
-                    {user_query}
-
-                    ANSWER:"""
-        
-        # Generate answer with OpenAI
-        client = OpenAI(api_key=os.getenv('OPENAI_API_KEY'))
-        completion = client.chat.completions.create(
-            model=model,
-            messages=[
-                {"role": "system", "content": "You are a helpful assistant that answers questions based on specific context provided."},
-                {"role": "user", "content": prompt}
-            ],
-            temperature=0.2,
-            max_tokens=1000
-        )
-        
-        answer = completion.choices[0].message.content
-        
-        return {
-            "answer": answer,
-            "sources": sources,
-            "has_context": True
-        }
-        
-    except Exception as e:
-        logger.error(f"Error generating answer: {e}")
         raise
 
 def delete_all_embeddings_from_index(index_name: str = PINECONE_INDEX_NAME):
@@ -640,8 +598,6 @@ def process_smart_content(content_data, file_id, filename, conversation_id):
         combined_text = ' '.join(text_pages)
         
         # Chunk the text
-        CHUNK_SIZE = 1000
-        CHUNK_OVERLAP = 200
         text_chunks = chunk_text(combined_text, CHUNK_SIZE, CHUNK_OVERLAP)
         
         # Combine table chunks and text chunks
@@ -656,37 +612,42 @@ def process_smart_content(content_data, file_id, filename, conversation_id):
         embeddings = create_embeddings(all_chunks)
         
         # Map table chunks directly to their page numbers
-        # For text chunks, approximate the page mapping
         chunk_page_numbers = []
         
         # Add table page numbers first
         chunk_page_numbers.extend(table_page_numbers)
         
-        # Map text chunks to approximate page numbers
-        text_processed = 0
-        current_page_idx = 0
-        
-        if text_pages and page_numbers:  # Only if we have text content
-            current_page_text = text_pages[current_page_idx]
-            current_page_length = len(current_page_text)
-            current_page_number = page_numbers[current_page_idx]
+        # Calculate cumulative text lengths for page boundary detection
+        if text_pages:
+            cumulative_lengths = [0]  # Start with 0
+            current_length = 0
+            for text in text_pages:
+                current_length += len(text)
+                cumulative_lengths.append(current_length)
             
+            # For each text chunk, determine which page it starts on
             for chunk in text_chunks:
-                chunk_length = len(chunk)
+                # Calculate where this chunk starts in the combined text
+                chunk_start_pos = combined_text.find(chunk[:50])  # Use first 50 chars for reliable match
                 
-                # If this chunk would exceed the current page, move to the next page
-                while current_page_idx < len(text_pages) - 1 and text_processed + chunk_length > current_page_length:
-                    text_processed = 0
-                    current_page_idx += 1
-                    current_page_text = text_pages[current_page_idx]
-                    current_page_length = len(current_page_text)
-                    current_page_number = page_numbers[current_page_idx]
+                # If match not found, use a different approach
+                if chunk_start_pos == -1:
+                    logger.warning(f"Could not find exact chunk position. Using approximate mapping.")
+                    # Just place in middle if we can't find it
+                    chunk_start_pos = current_length // 2
                 
-                # Assign the current page number to this chunk
-                chunk_page_numbers.append(current_page_number)
-                
-                # Update text processed
-                text_processed += chunk_length
+                # Find which page this position corresponds to
+                page_idx = 0
+                while page_idx < len(cumulative_lengths) - 1 and chunk_start_pos >= cumulative_lengths[page_idx + 1]:
+                    page_idx += 1
+                    
+                # Assign the page number
+                if page_idx < len(page_numbers):
+                    chunk_page_numbers.append(page_numbers[page_idx])
+                else:
+                    # Fallback to last page if something went wrong
+                    chunk_page_numbers.append(page_numbers[-1])
+                    logger.warning(f"Page mapping issue - assigned to last page")
         
         # Get or create Pinecone index
         index = create_or_get_index(PINECONE_INDEX_NAME, EMBEDDING_DIMENSION)

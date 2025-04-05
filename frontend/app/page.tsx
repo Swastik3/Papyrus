@@ -9,10 +9,23 @@ import InputForm from '@/components/InputForm';
 import PDFViewer from '@/components/PDFViewer';
 import { citationService } from '@/lib/CitationService';
 
+export interface Source {
+  key: string;
+  file_name: string | null;
+  page_number: number | null;
+  text: string | null;
+}
+
+export interface Paragraph {
+  text: string;
+  sources: Source[];
+}
+
 export interface Message {
-  role: 'user' | 'assistant';
+  role: 'user' | 'assistant' | 'system';
   content: string;
   sources?: string[];
+  paragraphs?: Paragraph[]; // Add support for structured paragraphs
 }
 
 interface ConversationMessages {
@@ -190,7 +203,8 @@ export default function Home() {
       ).map((msg: any) => ({
         role: msg.role,
         content: msg.content,
-        sources: msg.sources || []
+        sources: msg.sources || [],
+        paragraphs: msg.paragraphs || [] // Include paragraphs if available
       }));
       
       console.log(`Loaded ${formattedMessages.length} messages for conversation:`, id);
@@ -312,18 +326,23 @@ export default function Home() {
     });
   };
 
-  const handleQueryResponse = (answer: string, sources: string[]) => {
+  const handleQueryResponse = (answer: string, sources: string[], structured_data?: any) => {
     console.log("Query complete for conversation:", conversationId);
     
     // Save the current streaming content to avoid race conditions
     const finalContent = isStreaming ? streamingContent : answer;
     
     // Create new assistant message
-    const assistantMessage = { 
+    const assistantMessage: Message = { 
       role: 'assistant', 
       content: finalContent.length > 0 ? finalContent : answer,
       sources: sources 
     };
+    
+    // Add structured paragraphs if available
+    if (structured_data && Array.isArray(structured_data)) {
+      assistantMessage.paragraphs = structured_data;
+    }
     
     // Add the final message
     const updatedMessages = [...messages, assistantMessage];

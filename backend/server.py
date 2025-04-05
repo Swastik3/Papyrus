@@ -17,8 +17,8 @@ import pandas as pd
 import time
 from pypdf import PdfReader
 import io
-# from gevent import monkey
-# monkey.patch_all()
+from openai import OpenAI
+import tempfile
 load_dotenv()
 from conversation import (
     get_all_conversations_from_db,
@@ -26,7 +26,8 @@ from conversation import (
     generate_answer_with_context_and_history,
     add_file_to_conversation,
     get_conversation_files,
-    ConversationManager
+    ConversationManager,
+    generate_answer_with_context_and_history
 )
 # Import RAG utilities
 from rag_utils import (
@@ -54,6 +55,7 @@ socketio = SocketIO(app, cors_allowed_origins="*", ping_timeout=60, ping_interva
 
 # Configure upload folder
 UPLOAD_FOLDER = 'uploads'
+DEFAULT_MODEL = "gpt-4o-mini"
 if not os.path.exists(UPLOAD_FOLDER):
     os.makedirs(UPLOAD_FOLDER)
 
@@ -86,164 +88,6 @@ def cleanup_upload(upload_id):
         del active_uploads[upload_id]
     logger.info(f"Cleaned up upload: {upload_id}")
 
-def process_pdf_pages(file_bytes, upload_id, file_id, filename, sid, conversation_id):
-    """Process PDF pages and send progress updates via WebSocket"""
-    try:
-       
-        
-        # Read the PDF
-        pdf_stream = io.BytesIO(file_bytes)
-        pdf = PdfReader(pdf_stream)
-        total_pages = len(pdf.pages)
-        
-        # Initialize upload info
-        active_uploads[upload_id] = {
-            'filename': filename,
-            'file_id': file_id,
-            'start_time': time.time(),
-            'sid': sid,
-            'total_pages': total_pages,
-            'processed_pages': 0,
-            'completed': False
-        }
-        
-        # Extract text from pages
-        all_page_data = []
-        for pageNum in range(total_pages):
-            page = pdf.pages[pageNum]
-            text = page.extract_text()
-            all_page_data.append({
-                'pageNum': pageNum + 1,  # 1-indexed for user-friendliness
-                'text': text
-            })
-            
-            # Update processed pages
-            active_uploads[upload_id]['processed_pages'] = pageNum + 1
-            
-            # Calculate progress percentage
-            progress = int(((pageNum + 1) / total_pages) * 100)
-            
-            # Emit progress update
-            socketio.emit('upload_progress', {
-                'id': upload_id,
-                'fileId': file_id,
-                'fileName': filename,
-                'progress': progress,
-                'status': 'uploading',
-                'message': f'Extracting text from page {pageNum + 1}/{total_pages}',
-                'processedPages': pageNum + 1,
-                'totalPages': total_pages
-            }, room=sid)
-        
-        # Process all pages at once
-        socketio.emit('upload_progress', {
-            'id': upload_id,
-            'fileId': file_id,
-            'fileName': filename,
-            'progress': 100,
-            'status': 'uploading',
-            'message': f'Processing extracted text...',
-            'processedPages': total_pages,
-            'totalPages': total_pages
-        }, room=sid)
-        
-        # Process the chunks
-        chunks_processed = process_pdf_chunk(all_page_data, file_id, filename, conversation_id)
-        
-        # Mark as completed
-        active_uploads[upload_id]['completed'] = True
-        
-        # Final update
-        socketio.emit('upload_progress', {
-            'id': upload_id,
-            'fileId': file_id,
-            'fileName': filename,
-            'progress': 100,
-            'status': 'completed',
-            'message': f'PDF processed and indexed successfully',
-            'processedPages': total_pages,
-            'totalPages': total_pages
-        }, room=sid)
-        
-        logger.info(f"Completed processing PDF {filename} with {chunks_processed} chunks")
-        return file_id
-        
-    except Exception as e:
-        logger.error(f"Error processing PDF: {str(e)}")
-        socketio.emit('upload_progress', {
-            'id': upload_id,
-            'fileId': file_id,
-            'fileName': filename,
-            'progress': 0,
-            'status': 'error',
-            'error': f'Error processing PDF: {str(e)}'
-        }, room=sid)
-        return None
-
-@app.route('/api/upload-pdf-new', methods=['POST'])
-def upload_pdf():
-    """Handle PDF upload via HTTP POST"""
-    try:
-        # Check if file is in the request
-        if 'file' not in request.files:
-            return jsonify({'success': False, 'error': 'No file provided'}), 400
-            
-        file = request.files['file']
-        conversation_id = request.form.get('conversationId')
-        print(f"Conversation ID: {conversation_id}")
-        # Check if filename is empty
-        if file.filename == '':
-            return jsonify({'success': False, 'error': 'No file selected'}), 400
-            
-        # Check if file is a PDF
-        if not file.filename.lower().endswith('.pdf'):
-            return jsonify({'success': False, 'error': 'File must be a PDF'}), 400
-        
-        # Get upload ID from form or generate one
-        upload_id = request.form.get('uploadId', f"upload-{uuid.uuid4()}")
-        
-        # Generate a unique filename
-        file_id = str(uuid.uuid4())
-        filename = file.filename
-        secure_name = secure_filename(filename)
-        unique_filename = f"{file_id}_{secure_name}"
-        file_path = os.path.join(UPLOAD_FOLDER, unique_filename)
-        
-        # Save file to disk
-        file.save(file_path)
-        logger.info(f"File saved to {file_path}")
-        
-        # Get client's socket ID
-        sid = request.form.get('socketId')
-        if not sid:
-            # Get client connections for this session
-            return jsonify({'success': False, 'error': 'Socket ID required for progress updates'}), 400
-        
-        # Read the file into memory
-        with open(file_path, 'rb') as f:
-            file_bytes = f.read()
-        
-        # Process the PDF (non-threaded)
-        result_file_id = process_pdf_pages(file_bytes, upload_id, file_id, filename, sid, conversation_id)
-        # Update MongoDB document with the file information
-        if add_file_to_conversation(conversation_id, filename, unique_filename):
-            logger.info(f"Added file {filename} to conversation {conversation_id}")
-        if result_file_id:
-            return jsonify({
-                'success': True,
-                'fileId': file_id,
-                'filename': filename,
-                'message': 'File processed successfully'
-            })
-        else:
-            return jsonify({
-                'success': False,
-                'error': 'Failed to process PDF'
-            }), 500
-        
-    except Exception as e:
-        logger.error(f"Error in upload_pdf: {str(e)}")
-        return jsonify({'success': False, 'error': str(e)}), 500
 
 @app.route('/api/pdfs', methods=['GET'])
 def list_pdfs():
@@ -358,7 +202,7 @@ def delete_conversation_endpoint():
         logger.error(f"Error deleting conversation: {e}")
         return jsonify({'error': str(e)}), 500
 
-@socketio.on('query')
+@socketio.on('query-old')
 def handle_query(data):
     """Handle WebSocket query and stream response"""
     try:
@@ -421,7 +265,7 @@ def get_citation_text():
         citation_source = data.get('source')
         conversation_id = data.get('conversationId')
         # Not implemented yet 
-        return jsonify({'error': 'Invalid citation source format'}), 400
+        return jsonify({'success': 'mock endpoint'}), 200
         
     except Exception as e:
         logger.error(f"Error getting citation text: {e}")
@@ -742,7 +586,6 @@ def process_pdf_page(page, page_num, temp_file_path, detector, formatter):
     # Get PyMuPDFDocument page for table detection
     try:
         pymupdf_page = PyMuPDFDocument(temp_file_path)[page_num - 1]
-        
         # Detect tables on the page
         page_tables = detector.extract(pymupdf_page)
         
@@ -814,7 +657,7 @@ def process_pdf_page(page, page_num, temp_file_path, detector, formatter):
 
 
 @app.route('/api/upload-pdf', methods=['POST'])
-def upload_pdf_new():
+def upload_pdf_smart():
     """Handle PDF upload via HTTP POST with smart chunking"""
     try:
         # Check if file is in the request
@@ -880,8 +723,215 @@ def upload_pdf_new():
     except Exception as e:
         logger.error(f"Error in upload_pdf_new: {str(e)}")
         return jsonify({'success': False, 'error': str(e)}), 500
-    
-    
+
+@socketio.on('query')
+def handle_structured_query(data):
+    try:
+        query = data.get('query')
+        model = data.get('model', DEFAULT_MODEL)
+        query_id = data.get('queryId', str(uuid.uuid4()))
+        conversation_id = data.get('conversationId')
+        
+        if not query:
+            emit('query_error', {
+                'queryId': query_id,
+                'error': 'No query provided'
+            })
+            return
+        
+        # Emit that we're processing the query
+        emit('query_processing', {
+            'queryId': query_id,
+            'status': 'processing'
+        })
+        
+        # Define a function to emit tokens during streaming
+        def emit_token(event, data):
+            socketio.emit(event, data, room=request.sid)
+        
+        # Generate answer using the wrapper function
+        result = generate_answer_with_context_and_history(
+            query, 
+            model=model, 
+            conversation_id=conversation_id,
+            streaming=True,
+            socket_emit_func=emit_token
+        )
+        
+        # Emit the final result with all available data
+        response_data = {
+            'queryId': query_id,
+            'status': 'completed',
+            'answer': result['answer'],
+            'sources': result.get('sources', []),
+            'has_context': result.get('has_context', False),
+            'processing_time': result.get('total_processing_time', result.get('processing_time', 0))
+        }
+        
+        # Include structured data if available
+        if 'structured_data' in result:
+            response_data['structured_data'] = result['structured_data']
+        
+        # Include any other fields that might be useful to the client
+        for key in ['raw_response', 'validation_error']:
+            if key in result:
+                response_data[key] = result[key]
+        
+        socketio.emit('query_result', response_data, room=request.sid)
+        
+    except Exception as e:
+        logger.error(f"Error in handle_structured_query: {str(e)}")
+        emit('query_error', {
+            'queryId': query_id if 'query_id' in locals() else 'unknown',
+            'error': str(e)
+        })
+
+@app.route('/api/export-conversation', methods=['POST'])
+def export_conversation_endpoint():
+    """
+    Export a specific conversation from the database as JSON
+    """
+    try:
+        data = request.json
+        conversation_id = data.get('conversationId')
+        
+        if not conversation_id:
+            return jsonify({'error': 'No conversation ID provided'}), 400
+        
+        # Initialize conversation manager
+        conversation_manager = ConversationManager()
+        
+        # Get the full conversation document from MongoDB
+        conversation_document = conversation_manager.get_full_conversation(conversation_id)
+        
+        if not conversation_document:
+            logger.error(f"Failed to find conversation {conversation_id}")
+            return jsonify({'error': 'Conversation not found'}), 404
+            
+        # Return the full MongoDB document
+        return jsonify(conversation_document)
+        
+    except Exception as e:
+        logger.error(f"Error exporting conversation: {e}")
+        return jsonify({'error': str(e)}), 500
+
+@app.route('/api/transcribe-audio', methods=['POST'])
+def transcribe_audio():
+    """
+    Handle audio transcription using OpenAI Whisper API
+    """
+    try:
+        # Check if audio file is in the request
+        if 'audio' not in request.files:
+            return jsonify({'success': False, 'error': 'No audio file provided'}), 400
+            
+        audio_file = request.files['audio']
+        conversation_id = request.form.get('conversationId')
+        socket_id = request.form.get('socketId')
+        
+        if not audio_file:
+            return jsonify({'success': False, 'error': 'Invalid audio file'}), 400
+            
+        if not socket_id:
+            return jsonify({'success': False, 'error': 'Socket ID required for streaming responses'}), 400
+        
+        # Create a temp file to store the audio
+        with tempfile.NamedTemporaryFile(delete=False, suffix='.webm') as temp_audio:
+            audio_file.save(temp_audio.name)
+            temp_audio_path = temp_audio.name
+        
+        # Start transcription in a separate thread to avoid blockingtarget=process_audio_transcription(temp_audio_path, socket_id, conversation_id)
+        process_audio_transcription(temp_audio_path, socket_id, conversation_id)
+        
+        return jsonify({
+            'success': True,
+            'message': 'Audio received, transcription in progress'
+        })
+        
+    except Exception as e:
+        logger.error(f"Error in transcribe_audio: {str(e)}")
+        return jsonify({'success': False, 'error': str(e)}), 500
+
+def process_audio_transcription(audio_path, socket_id, conversation_id):
+    """Process audio file with OpenAI Whisper and then generate a response"""
+    try:
+        # Initialize OpenAI client
+        client = OpenAI(api_key=os.getenv('OPENAI_API_KEY'))
+        
+        # Open the audio file
+        with open(audio_path, 'rb') as audio_file:
+            # Transcribe with Whisper
+            logger.info(f"Starting Whisper transcription for {socket_id}")
+            start_time = time.time()
+            
+            response = client.audio.transcriptions.create(
+                file=audio_file,
+                model="whisper-1",
+                language="en"  # Optionally specify language
+            )
+            
+            transcription = response.text
+            
+            elapsed_time = time.time() - start_time
+            logger.info(f"Transcription completed in {elapsed_time:.2f}s: {transcription[:50]}...")
+            
+            # Send transcription back to client
+            socketio.emit('transcription_result', {
+                'success': True,
+                'transcription': transcription
+            }, room=socket_id)
+            
+            # Emit the immediate transcription update to update the UI
+            socketio.emit('transcription_update', {
+                'success': True,
+                'transcription': transcription,
+                'conversation_id': conversation_id
+            }, room=socket_id)
+            
+            # Now process the transcribed text through our RAG pipeline
+            if transcription.strip():
+                # Define a function to emit tokens during streaming
+                def emit_token(event, data):
+                    socketio.emit(event, data, room=socket_id)
+                
+                # Generate answer using the standard RAG pipeline
+                logger.info(f"Generating answer for transcribed audio: {transcription[:50]}...")
+                
+                result = generate_answer_with_context_and_history(
+                    transcription, 
+                    model="gpt-4o-mini", 
+                    conversation_id=conversation_id,
+                    streaming=True,
+                    socket_emit_func=emit_token
+                )
+                
+                # Add transcription to result for client reference
+                result['transcription'] = transcription
+                
+                # Send final result
+                socketio.emit('query_result', {
+                    'queryId': f"audio-{int(time.time())}",
+                    'status': 'completed',
+                    'answer': result['answer'],
+                    'sources': result.get('sources', []),
+                    'has_context': result.get('has_context', False),
+                    'processing_time': result.get('total_processing_time', 0),
+                    'transcription': transcription,  # Include transcription in result
+                }, room=socket_id)
+                
+    except Exception as e:
+        logger.error(f"Error in audio transcription processing: {str(e)}")
+        socketio.emit('transcription_result', {
+            'success': False,
+            'error': str(e)
+        }, room=socket_id)
+    finally:
+        # Clean up the temporary file
+        try:
+            os.unlink(audio_path)
+        except Exception as e:
+            logger.error(f"Error removing temporary audio file: {str(e)}")
+            
 if __name__ == '__main__':
     # Initialize Pinecone
     initialize_pinecone()

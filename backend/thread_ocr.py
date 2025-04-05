@@ -56,34 +56,25 @@ def process_image(image_bytes, max_width=800, max_height=800):
         print(f"Error in OCR request: {e}")
         return None
 
-def worker(page_queue, results, file_id, filename, conversation_id, chunk_and_index_func=None, progress_callback=None):
-    """Worker thread to process pages from the queue"""
+def worker(page_queue, results, progress_callback=None):
+    """Worker thread to process pages from the queue - only performs OCR"""
     while not page_queue.empty():
         try:
             page_num, page_image = page_queue.get(block=False)
             
             # Update progress if callback is provided
             if progress_callback:
-                progress_callback(f"Processing page {page_num+1}")
+                progress_callback(f"Processing OCR for page {page_num+1}")
             
-            print(f"Processing page {page_num+1}")
+            print(f"Processing OCR for page {page_num+1}")
             
             # Perform OCR on the page
             ocr_text = process_image(page_image)
             results[page_num] = ocr_text
             
-            # If we have text and a function to chunk and index, use it
-            if ocr_text and chunk_and_index_func:
-                page_data = {
-                    'pageNum': page_num + 1,  # 1-indexed for user-friendliness
-                    'text': ocr_text
-                }
-                # Chunk and index this page
-                chunk_and_index_func([page_data], file_id, filename, conversation_id)
-            
             # Update progress again after page is complete
             if progress_callback:
-                progress_callback(f"Completed page {page_num+1}")
+                progress_callback(f"Completed OCR for page {page_num+1}")
                 
             page_queue.task_done()
         except queue.Empty:
@@ -121,12 +112,12 @@ def process_pdf_with_threads(pdf_bytes, file_id, filename, conversation_id,
         img_data = pix.tobytes("png")
         page_queue.put((page_idx, img_data))
     
-    # Create and start worker threads
+    # Create and start worker threads - ONLY for OCR processing
     threads = []
     for _ in range(min(max_workers, page_count)):
         thread = threading.Thread(
             target=worker, 
-            args=(page_queue, results, file_id, filename, conversation_id, chunk_and_index_func, progress_callback)
+            args=(page_queue, results, progress_callback)
         )
         thread.start()
         threads.append(thread)
@@ -138,7 +129,32 @@ def process_pdf_with_threads(pdf_bytes, file_id, filename, conversation_id,
     # Close the document
     doc.close()
     
-    # Collect results in order
+    # Collect results in order and prepare data for chunking
+    all_page_data = []
+    for i in range(page_count):
+        text = results.get(i, "")
+        if text:  # Only include pages with extracted text
+            all_page_data.append({
+                'pageNum': i + 1,  # 1-indexed for user-friendliness
+                'text': text
+            })
+    
+    # Now process all pages together with the chunking and indexing function
+    if all_page_data:
+        if progress_callback:
+            progress_callback(f"Chunking and indexing extracted text from {len(all_page_data)} pages")
+        
+        # Use the chunk_and_index_func to process all pages at once
+        try:
+            chunks_processed = chunk_and_index_func(all_page_data, file_id, filename, conversation_id)
+            if progress_callback:
+                progress_callback(f"Successfully indexed {chunks_processed} chunks from {len(all_page_data)} pages")
+        except Exception as e:
+            print(f"Error during chunking and indexing: {e}")
+            if progress_callback:
+                progress_callback(f"Error during chunking and indexing: {str(e)}")
+    
+    # Create combined text for return value
     ordered_results = [results.get(i, "") for i in range(page_count)]
     combined_text = "\n\n--- Page Break ---\n\n".join(ordered_results)
     

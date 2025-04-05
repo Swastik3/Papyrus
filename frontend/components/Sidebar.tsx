@@ -2,7 +2,7 @@
 
 import React, { useState, useEffect, useRef } from 'react';
 import { Message } from '../app/page';
-import { RefreshCw, MessageSquare, Trash2 } from 'lucide-react';
+import { RefreshCw, MessageSquare, Trash2, Download } from 'lucide-react';
 
 interface ConversationPreview {
   id: string;
@@ -30,6 +30,7 @@ const Sidebar: React.FC<SidebarProps> = ({
   const [conversations, setConversations] = useState<ConversationPreview[]>([]);
   const [isLoadingConversations, setIsLoadingConversations] = useState(false);
   const [deletingConversationId, setDeletingConversationId] = useState<string | null>(null);
+  const [exportingConversationId, setExportingConversationId] = useState<string | null>(null);
   const sidebarRef = useRef<HTMLDivElement>(null);
 
   // Fetch all conversations from the backend
@@ -65,6 +66,51 @@ const Sidebar: React.FC<SidebarProps> = ({
       console.error('Error fetching conversations:', error);
     } finally {
       setIsLoadingConversations(false);
+    }
+  };
+
+  // Export conversation as JSON
+  const exportConversation = async (conversationId: string) => {
+    try {
+      setExportingConversationId(conversationId);
+      
+      // Call the API to get conversation export
+      const response = await fetch('http://localhost:5001/api/export-conversation', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json'
+        },
+        body: JSON.stringify({
+          conversationId
+        })
+      });
+      
+      if (!response.ok) {
+        throw new Error('Failed to export conversation');
+      }
+      
+      const data = await response.json();
+      
+      // Create a downloadable file from the JSON response
+      const blob = new Blob([JSON.stringify(data, null, 2)], { type: 'application/json' });
+      const url = URL.createObjectURL(blob);
+      
+      // Create a temporary link and trigger the download
+      const link = document.createElement('a');
+      link.href = url;
+      link.download = `conversation-${conversationId.substring(0, 8)}.json`;
+      document.body.appendChild(link);
+      link.click();
+      
+      // Clean up
+      document.body.removeChild(link);
+      URL.revokeObjectURL(url);
+      
+    } catch (error) {
+      console.error('Error exporting conversation:', error);
+      alert('Failed to export conversation');
+    } finally {
+      setExportingConversationId(null);
     }
   };
 
@@ -131,33 +177,53 @@ const Sidebar: React.FC<SidebarProps> = ({
                       <MessageSquare size={16} className="mr-2 text-gray-400 flex-shrink-0" />
                       <div className="truncate text-sm text-gray-200">{conv.firstMessage}</div>
                     </div>
-                    {onDeleteConversation && (
+                    <div className="flex items-center space-x-1 flex-shrink-0">
+                      {/* Export button */}
                       <button
                         onClick={(e) => {
                           e.stopPropagation();
-                          if (window.confirm('Are you sure you want to delete this conversation?')) {
-                            setDeletingConversationId(conv.id);
-                            onDeleteConversation(conv.id)
-                              .then(() => {
-                                // Remove from local state on success
-                                setConversations(conversations.filter(c => c.id !== conv.id));
-                              })
-                              .finally(() => {
-                                setDeletingConversationId(null);
-                              });
-                          }
+                          exportConversation(conv.id);
                         }}
-                        className="ml-2 p-1 rounded hover:bg-[#3A3A3A] text-gray-500 hover:text-red-400 flex-shrink-0"
-                        title="Delete conversation"
-                        disabled={deletingConversationId === conv.id}
+                        className="p-1 rounded hover:bg-[#3A3A3A] text-gray-500 hover:text-blue-400"
+                        title="Export conversation"
+                        disabled={exportingConversationId === conv.id}
                       >
-                        {deletingConversationId === conv.id ? (
+                        {exportingConversationId === conv.id ? (
                           <div className="w-3.5 h-3.5 rounded-full border-2 border-gray-500 border-t-transparent animate-spin" />
                         ) : (
-                          <Trash2 size={14} />
+                          <Download size={14} />
                         )}
                       </button>
-                    )}
+                      
+                      {/* Delete button */}
+                      {onDeleteConversation && (
+                        <button
+                          onClick={(e) => {
+                            e.stopPropagation();
+                            if (window.confirm('Are you sure you want to delete this conversation?')) {
+                              setDeletingConversationId(conv.id);
+                              onDeleteConversation(conv.id)
+                                .then(() => {
+                                  // Remove from local state on success
+                                  setConversations(conversations.filter(c => c.id !== conv.id));
+                                })
+                                .finally(() => {
+                                  setDeletingConversationId(null);
+                                });
+                            }
+                          }}
+                          className="p-1 rounded hover:bg-[#3A3A3A] text-gray-500 hover:text-red-400"
+                          title="Delete conversation"
+                          disabled={deletingConversationId === conv.id}
+                        >
+                          {deletingConversationId === conv.id ? (
+                            <div className="w-3.5 h-3.5 rounded-full border-2 border-gray-500 border-t-transparent animate-spin" />
+                          ) : (
+                            <Trash2 size={14} />
+                          )}
+                        </button>
+                      )}
+                    </div>
                   </div>
                 ))
               ) : (

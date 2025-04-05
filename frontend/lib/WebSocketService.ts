@@ -131,6 +131,18 @@ export class WebSocketService {
         }
       });
 
+      // Add listener for transcription result
+      this.socket.on('transcription_result', (data) => {
+        console.log('Transcription result received:', data);
+        this.emit('transcription_result', data);
+      });
+
+      // Add listener for immediate transcription update
+      this.socket.on('transcription_update', (data) => {
+        console.log('Transcription update received:', data);
+        this.emit('transcription_update', data);
+      });
+
       // Add listeners for query processing status
       this.socket.on('query_processing', (data) => {
         console.log('Query processing:', data);

@@ -9,7 +9,7 @@ import pymongo
 from pymongo import MongoClient
 from dotenv import load_dotenv
 from openai import OpenAI
-
+from structured_output import generate_answer_with_structured_context
 # Import the RAG utilities
 from rag_utils import (
     get_relevant_context,
@@ -431,156 +431,81 @@ class ConversationManager:
         except Exception as e:
             logger.error(f"Error getting files for conversation {conversation_id}: {e}")
             return {}
-    
-
-def generate_answer_with_context_and_history(
-    user_query: str, 
-    model: str = DEFAULT_MODEL,
-    conversation_id: Optional[str] = None,
-    streaming: bool = False,
-    socket_emit_func = None
-) -> Dict[str, Any]:
-    """
-    Generate an answer to a user query using context from vector search and conversation history
-    
-    Args:
-        user_query: The user's question
-        model: The OpenAI model to use for generating the answer
-        conversation_id: Optional ID to keep track of conversation history
-        streaming: Whether to stream the response tokens
-        socket_emit_func: Function to emit streaming tokens if streaming is True
-        filters: Optional metadata filters to apply when retrieving documents
         
-    Returns:
-        Dictionary containing the answer, sources, and whether relevant context was found
-    """
-    start_time = time.time()
-    logger.info(f"Generating answer for query: '{user_query}' with model {model}")
-    
-    # Ensure the conversation manager is initialized
-    global conversation_manager
-    if conversation_manager is None:
-        conversation_manager = ConversationManager()
-    
-    try:
-        # Get relevant context
-        context, sources = get_relevant_context(user_query, conversation_id=conversation_id)
+    def add_structured_message(self, conversation_id: str, structured_message: Dict[str, Any]) -> None:
+        """
+        Add a simplified structured message to the conversation history
         
-        # If no relevant context found
+        Args:
+            conversation_id: Unique identifier for the conversation
+            structured_message: Message with role, content, and simplified paragraph structure
+        """
+        # Get existing messages
+        messages = self.get_conversation(conversation_id)
         
-        if not context:
-            context_prompt = f"""You are answering a question generally.
-                    {user_query}
-                    """
-            has_context = False
+        # Add new structured message
+        messages.append(structured_message)
         
-        # Create prompt with context
-        else: 
-            context_prompt = f"""You are answering a question based on specific context provided.
-                    Answer the question based ONLY on the context provided.
-                    If the context doesn't contain the information needed to answer the question, say "I don't have enough information to answer that question."
-                    Do not use any prior knowledge outside what is provided in the context or conversation history.
-
-                    CONTEXT:
-                    {context}
-
-                    QUESTION:
-                    {user_query}
-                    """
-            has_context = True
-        
-        # Initialize OpenAI client
-        client = OpenAI(api_key=os.getenv('OPENAI_API_KEY'))
-        
-        # Get conversation history if available
-        messages = []
-        if conversation_id:
-            # Get existing conversation
-            messages = conversation_manager.get_conversation(conversation_id).copy()
-            # Add the context and question as the latest user message
-            messages.append({"role": "user", "content": context_prompt})
-        else:
-            # No conversation history, just use system message and the prompt
-            messages = [
-                {"role": "system", "content": "You are a helpful assistant that answers questions based on specific context provided."},
-                {"role": "user", "content": context_prompt}
-            ]
-        
-        # Prepare request parameters
-        request_params = {
-            "model": model,
-            "messages": messages,
-            "temperature": 0.2,
-            "max_tokens": 2000
+        # Update cache
+        conversation_cache[conversation_id] = {
+            'data': messages,
+            'last_accessed': time.time()
         }
         
-        # Add streaming parameters if enabled
-        if streaming:
-            request_params["stream"] = True
+        # Update MongoDB
+        try:
+            collection = self.collection
+            collection.update_one(
+                {"conversation_id": conversation_id},
+                {
+                    "$set": {
+                        "messages": messages,
+                        "last_updated": datetime.utcnow()
+                    }
+                },
+                upsert=True
+            )
+            logger.info(f"Added simplified message to conversation {conversation_id} and updated MongoDB")
+        except Exception as e:
+            logger.error(f"Error updating conversation in MongoDB: {e}")
+
+    def get_full_conversation(self, conversation_id):
+        """
+        Get the full MongoDB document for a conversation
         
-        # Generate answer with OpenAI
-        if streaming and socket_emit_func:
-            # Handle streaming response
-            logger.info(f"Streaming enabled, will emit tokens via WebSocket")
-            answer_chunks = []
+        Args:
+            conversation_id: The ID of the conversation to retrieve
             
-            # Make streaming request
-            stream = client.chat.completions.create(**request_params)
+        Returns:
+            The full conversation document as a dictionary, or None if not found
+        """
+        try:
+            # Find the conversation by ID
+            collection = self.collection
+            conversation = collection.find_one({"conversation_id": conversation_id})
             
-            for chunk in stream:
-                if chunk.choices[0].delta.content:
-                    content = chunk.choices[0].delta.content
-                    answer_chunks.append(content)
-                    print(content, end='', flush=True)
-                    # Emit the token to the client
-                    logger.debug(f"Emitting token: {content}")
-                    socket_emit_func('token', {'token': content})
+            if not conversation:
+                return None
+                
+            # Convert ObjectId to string for JSON serialization
+            conversation['_id'] = str(conversation['_id'])
+            
+            # Convert any other MongoDB-specific types that may not be JSON serializable
+            for message in conversation.get('messages', []):
+                if '_id' in message:
+                    message['_id'] = str(message['_id'])
                     
-                    # Small delay to avoid overwhelming the client
-                    time.sleep(0.2)
+            # Process any nested documents
+            if 'files' in conversation and isinstance(conversation['files'], dict):
+                for file_key, file_value in conversation['files'].items():
+                    if hasattr(file_value, 'to_json'):
+                        conversation['files'][file_key] = file_value.to_json()
+                        
+            return conversation
             
-            # Combine chunks into final answer
-            answer = ''.join(answer_chunks)
-            logger.info(f"Streaming complete, total response length: {len(answer)}")
-        else:
-            # Non-streaming request
-            logger.info(f"Using non-streaming request")
-            completion = client.chat.completions.create(**request_params)
-            answer = completion.choices[0].message.content
-            
-        # Add to conversation history if we have a conversation ID
-        if conversation_id:
-            conversation_manager.add_to_conversation(conversation_id, "user", user_query)
-            conversation_manager.add_to_conversation(conversation_id, "assistant", answer)
-        
-        elapsed_time = time.time() - start_time
-        logger.info(f"Generated answer in {elapsed_time:.2f} seconds")
-        
-        return {
-            "answer": answer,
-            "sources": sources,
-            "has_context": has_context,
-            "processing_time": round(elapsed_time, 2)
-        }
-        
-    except Exception as e:
-        elapsed_time = time.time() - start_time
-        logger.error(f"Error generating answer: {e}")
-        
-        error_message = f"I encountered an error while processing your question: {str(e)}"
-        
-        # Still add to conversation history if we have a conversation ID
-        if conversation_id:
-            conversation_manager.add_to_conversation(conversation_id, "user", user_query)
-            conversation_manager.add_to_conversation(conversation_id, "assistant", error_message)
-        
-        return {
-            "answer": error_message,
-            "sources": [],
-            "has_context": False,
-            "processing_time": round(elapsed_time, 2),
-            "error": str(e)
-        }
+        except Exception as e:
+            logger.error(f"Error getting full conversation: {e}")
+            return None
 
 def clear_conversation(conversation_id: str) -> bool:
     """
@@ -700,91 +625,111 @@ def add_file_to_conversation(conversation_id: str, filename: str, unique_filenam
 def get_conversation_files(conversation_id: str,):
     return conversation_manager.get_conversation_files(conversation_id)
 
-# Example Flask API routes (commented out for reference):
-"""
-@app.route('/api/query', methods=['POST'])
-def query_pdf_content():
+def generate_answer_with_context_and_history(
+    user_query: str, 
+    model: str = DEFAULT_MODEL,
+    conversation_id: Optional[str] = None,
+    streaming: bool = False,
+    socket_emit_func = None
+) -> Dict[str, Any]:
+    """
+    Wrapper function that uses the structured context generator and adds results to conversation history
+    
+    Args:
+        user_query: The user's question
+        model: The OpenAI model to use for generating the answer
+        conversation_id: Optional ID to keep track of conversation history
+        streaming: Whether to stream the response tokens
+        socket_emit_func: Function to emit streaming tokens if streaming is True
+        
+    Returns:
+        Dictionary containing the answer, sources, and whether relevant context was found
+    """
+    start_time = time.time()
+    logger.info(f"Wrapper: Generating answer for query: '{user_query}' with model {model}")
+    
+    # Ensure the conversation manager is initialized
+    global conversation_manager
+    if conversation_manager is None:
+        conversation_manager = ConversationManager()
+    
     try:
-        data = request.json
-        query = data.get('query')
-        model = data.get('model', DEFAULT_MODEL)
-        conversation_id = data.get('conversation_id')
+        # Get conversation history from MongoDB if conversation_id is provided
+        conversation_history = []
+        if conversation_id:
+            conversation_history = conversation_manager.get_conversation(conversation_id)
+            # Extract only role and content from conversation history for the LLM context
+            # This prevents the model from seeing the structured data and sources directly
+            simplified_history = []
+            for message in conversation_history:
+                # Only include role and content fields
+                simplified_message = {
+                    "role": message.get("role", ""),
+                    "content": message.get("content", "")
+                }
+                simplified_history.append(simplified_message)
+            
+            # Replace the full history with the simplified version
+            conversation_history = simplified_history
+            logger.info(f"Retrieved {len(conversation_history)} messages from conversation history")
         
-        if not query:
-            return jsonify({'error': 'No query provided'}), 400
-        
-        logger.info(f"Processing query: {query}")
-        
-        # Generate answer with context and history
-        result = generate_answer_with_context_and_history(
-            query, 
-            model=model, 
-            conversation_id=conversation_id
-        )
-        
-        return jsonify(result)
-        
-    except Exception as e:
-        logger.error(f"Error processing query: {e}")
-        return jsonify({
-            'error': str(e),
-            'answer': "I encountered an error while processing your question. Please try again.",
-            'sources': [],
-            'has_context': False
-        }), 500
-
-@socketio.on('query')
-def handle_query(data):
-    try:
-        query = data.get('query')
-        model = data.get('model', DEFAULT_MODEL)
-        query_id = data.get('queryId', str(uuid.uuid4()))
-        conversation_id = data.get('conversationId')
-        
-        if not query:
-            emit('query_error', {
-                'queryId': query_id,
-                'error': 'No query provided'
-            })
-            return
-        
-        # Emit that we're processing the query
-        emit('query_processing', {
-            'queryId': query_id,
-            'status': 'processing'
-        })
-        
-        # Define a function to emit tokens during streaming
-        def emit_token(event, data):
-            socketio.emit(event, data, room=request.sid)
-        
-        # Generate answer with streaming
-        result = generate_answer_with_context_and_history(
-            query, 
-            model=model, 
+        # Use the structured context generator with conversation history
+        result = generate_answer_with_structured_context(
+            user_query=user_query,
+            model=model,
             conversation_id=conversation_id,
-            streaming=True,
-            socket_emit_func=emit_token
+            conversation_history=conversation_history
         )
         
-        # Emit the final result
-        socketio.emit('query_result', {
-            'queryId': query_id,
-            'status': 'completed',
-            'answer': result['answer'],
-            'sources': result['sources'],
-            'has_context': result['has_context'],
-            'processing_time': result['processing_time']
-        }, room=request.sid)
+        # Extract the info we need
+        answer = result["answer"]
+        structured_data = result["structured_data"]
+        sources = result["sources"]
+        has_context = result["has_context"]
+        
+        # Prepare the structured message to add to conversation history
+        structured_message = {
+            "role": "assistant",
+            "content": answer,
+            "paragraphs": structured_data
+        }
+        
+        # Add to conversation history if we have a conversation ID
+        if conversation_id:
+            # Add the user query to the conversation history
+            conversation_manager.add_to_conversation(conversation_id, "user", user_query)
+            conversation_manager.add_structured_message(conversation_id, structured_message)
+            logger.info(f"Added structured message to conversation {conversation_id}")
+        
+        elapsed_time = time.time() - start_time
+        
+        return {
+            "answer": answer,
+            "structured_data": structured_data,
+            "sources": sources,
+            "has_context": has_context,
+            "processing_time": round(elapsed_time, 2)
+        }
         
     except Exception as e:
-        logger.error(f"Error in handle_query: {str(e)}")
-        emit('query_error', {
-            'queryId': query_id if 'query_id' in locals() else 'unknown',
-            'error': str(e)
-        })
-"""
-
+        elapsed_time = time.time() - start_time
+        logger.error(f"Error in wrapper function: {e}")
+        
+        error_message = f"I encountered an error while processing your question: {str(e)}"
+        
+        # Add error to conversation history if we have a conversation ID
+        if conversation_id:
+            conversation_manager.add_to_conversation(conversation_id, "user", user_query)
+            conversation_manager.add_to_conversation(conversation_id, "assistant", error_message)
+        
+        return {
+            "answer": error_message,
+            "sources": [],
+            "structured_data": [],
+            "has_context": False,
+            "processing_time": round(elapsed_time, 2),
+            "error": str(e)
+        }
 if __name__ == "__main__":
     # Example usage
     try:
@@ -792,37 +737,3 @@ if __name__ == "__main__":
         print("MongoDB connection successful.")
     except Exception as e:
         print(f"MongoDB connection failed: {e}")
-    # conversation_id = f"test-{uuid.uuid4()}"
-    # print(f"Testing with conversation ID: {conversation_id}")
-    
-    # # First query
-    # first_query = "What is this document about?"
-    # print(f"\nFirst Query: '{first_query}'")
-    
-    # result1 = generate_answer_with_context_and_history(
-    #     first_query,
-    #     conversation_id=conversation_id
-    # )
-    
-    # print(f"Answer: {result1['answer']}")
-    # print(f"Sources: {result1['sources']}")
-    
-    # # Second query that references the first
-    # second_query = "Can you tell me more about that topic?"
-    # print(f"\nSecond Query: '{second_query}'")
-    
-    # result2 = generate_answer_with_context_and_history(
-    #     second_query,
-    #     conversation_id=conversation_id
-    # )
-    
-    # print(f"Answer: {result2['answer']}")
-    # print(f"Sources: {result2['sources']}")
-    
-    # # Print the conversation history
-    # history = conversation_manager.get_conversation(conversation_id)
-    # print("\nConversation History:")
-    # for msg in history:
-    #     role = msg["role"]
-    #     if role != "system":
-    #         print(f"{role.upper()}: {msg['content'][:100]}...")
